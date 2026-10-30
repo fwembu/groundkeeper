@@ -43,9 +43,57 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
     return y > 32767 ? 32767 : y < -32767 ? -32767 : y;
 }
 
+/* ---- Groundkeeper's drone: DV voices that hold a chord and drift (the audio part; the decisions are in the main loop)
+ * Each voice is two sines a hair apart (slow beating) and a soft octave above, with its own slow "breath".
+ * The main loop sets a voice's target pitch; here the pitch glides there over a second or two. */
+#define DV 4u
+static struct {
+    volatile uint32_t tinc;                     /* target phase step (main loop writes) */
+    uint32_t inc;                               /* the step now: glides to tinc */
+    uint32_t pa, pb, lfo;                       /* the two sines' phases, the breath's phase */
+    volatile uint32_t lfo_inc;                  /* breath speed, per block */
+    volatile uint8_t note;
+} drone[DV];
+static volatile int32_t drone_on;               /* 1: growing / sounding, 0: fading to silence */
+static int32_t drone_lvl;                       /* the drone's level now, Q15: fades in and out */
+#define DRONE_GAIN 5200                         /* per voice, Q15: four voices with partials stay under full scale */
+
+static void drone_audio(int32_t *out, uint32_t n)
+{
+    uint32_t v, i;
+    int32_t lvl = drone_lvl;
+    if (drone_on) { lvl += 48; if (lvl > 32767) lvl = 32767; }   /* fade in ~4 s */
+    else { lvl -= 32; if (lvl < 0) lvl = 0; }                     /* fade out ~6 s */
+    drone_lvl = lvl;
+    if (!lvl) return;                           /* silent: costs nothing */
+    for (v = 0; v < DV; v++) {
+        uint32_t pa = drone[v].pa, pb = drone[v].pb, inc = drone[v].inc, tinc = drone[v].tinc, incb;
+        int32_t breath, g;
+        inc += (uint32_t)((int32_t)(tinc - inc) >> 7);   /* glide: ~1.5 s to settle */
+        if ((int32_t)(tinc - inc) > -128 && (int32_t)(tinc - inc) < 128) inc = tinc;
+        drone[v].inc = inc;
+        incb = inc + (inc >> 10);               /* +1.7 cents: a slow beat between the two */
+        drone[v].lfo += drone[v].lfo_inc;
+        breath = 24576 + ((sine(drone[v].lfo) * 8192) >> 15);   /* 0.5 .. 1.0 */
+        g = (((DRONE_GAIN * breath) >> 15) * lvl) >> 15;
+        for (i = 0; i < n; i++) {
+            int32_t s;
+            pa += inc;
+            pb += incb;
+            s = (sine(pa) + sine(pb) + (sine(pa << 1) >> 2)) >> 1;   /* two fundamentals, a quiet octave */
+            s = (s * g) >> 15;
+            out[2u * i] += s;
+            out[2u * i + 1u] += s;
+        }
+        drone[v].pa = pa;
+        drone[v].pb = pb;
+    }
+}
+
 static void app_audio(int32_t *out, uint32_t n)
 {
     uint32_t v, i;
+    drone_audio(out, n);
     for (v = 0; v < NV; v++) {
         uint32_t ph = voice[v].ph, step = (uint32_t)(((uint64_t)voice[v].inc * bend_q16) >> 16);   /* (int64 multiply: fine) */
         int32_t amp = voice[v].amp, g = voice[v].gate;
@@ -101,6 +149,86 @@ static int quiet(void)                          /* nothing sounds, not even a re
     return 1;
 }
 
+/* ---- Groundkeeper's growth (main loop): which chord the network holds, and how its voices drift.
+ * Six chords in C major, in a ring where neighbours share three notes, so every step is a small one.
+ * Every few seconds one voice moves to a note of the current chord; every few moves the chord steps along the ring. */
+static const uint8_t CHORD[6][4] = {            /* pitch classes, root first */
+    {0, 4, 7, 11}, {9, 0, 4, 7}, {5, 9, 0, 4}, {2, 5, 9, 0}, {7, 11, 2, 5}, {4, 7, 11, 2}};
+static const char *const CHORD_NAME[6] = {"Cmaj7", "Am7", "Fmaj7", "Dm7", "G7", "Em7"};
+static const uint8_t RANGE_LO[DV] = {40, 52, 57, 62}, RANGE_HI[DV] = {52, 64, 69, 74};   /* E2..E3, E3..E4, ... */
+static uint32_t rng = 0x2545F491u, chord_now, moves_left, t_next_move, grow_ver;
+
+static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
+{
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return n ? rng % n : 0u;
+}
+static uint32_t note_inc(uint32_t note) { return INC_C9[note % 12u] >> (10u - note / 12u); }
+static int in_chord(uint32_t note, uint32_t c)
+{
+    uint32_t k;
+    for (k = 0; k < 4u; k++) if (note % 12u == CHORD[c][k]) return 1;
+    return 0;
+}
+static int held_by_other(uint32_t pc, uint32_t v)   /* another upper voice already has this pitch class */
+{
+    uint32_t w;
+    for (w = 1; w < DV; w++) if (w != v && drone[w].note % 12u == pc) return 1;
+    return 0;
+}
+static uint32_t pick_note(uint32_t v, uint32_t c, int fresh)   /* a chord note in v's range, near where v is */
+{
+    uint32_t n, best = drone[v].note, bestd = 0xFFFFu;
+    for (n = RANGE_LO[v]; n <= RANGE_HI[v]; n++) {
+        uint32_t d = n > drone[v].note ? n - drone[v].note : drone[v].note - n;
+        if (v == 0u ? n % 12u != CHORD[c][0] : !in_chord(n, c) || held_by_other(n % 12u, v)) continue;
+        if (fresh && n == drone[v].note) continue;   /* a drift: somewhere new */
+        d = d * 4u + rnd(6u);                   /* nearest, with a little chance */
+        if (d < bestd) { bestd = d; best = n; }
+    }
+    return best;
+}
+static void voice_to(uint32_t v, uint32_t note)
+{
+    drone[v].note = (uint8_t)note;
+    drone[v].tinc = note_inc(note);
+    grow_ver++;
+}
+static void grow_start(void)                    /* PLAY: plant the network (silent, so no glide) */
+{
+    uint32_t v;
+    rng ^= fm1_ms * 2654435761u;
+    if (!rng) rng = 1;
+    chord_now = 0;
+    for (v = 0; v < DV; v++) drone[v].note = (uint8_t)((RANGE_LO[v] + RANGE_HI[v]) / 2u);
+    for (v = 0; v < DV; v++) {
+        uint32_t n = pick_note(v, chord_now, 0);
+        drone[v].note = (uint8_t)n;
+        drone[v].tinc = drone[v].inc = note_inc(n);
+        drone[v].lfo_inc = 4294967295u / (172u * (7u + rnd(13u)));   /* a breath every 7..19 s */
+    }
+    moves_left = 4u + rnd(3u);
+    t_next_move = fm1_ms + 6000u;
+    grow_ver++;
+    drone_on = 1;
+}
+static void grow_tick(void)                     /* call often; acts every few seconds */
+{
+    uint32_t v, w;
+    if (!drone_on || (int32_t)(fm1_ms - t_next_move) < 0) return;
+    t_next_move = fm1_ms + 3500u + rnd(4500u);  /* the next move in 3.5..8 s */
+    if (!moves_left) {                          /* the network shifts: a neighbour on the ring */
+        chord_now = (chord_now + (rnd(3u) ? 1u : 5u)) % 6u;
+        moves_left = 4u + rnd(3u);
+    }
+    moves_left--;
+    for (w = 0, v = DV; w < DV; w++)            /* a voice outside the chord moves first, the bass before the rest */
+        if (v == DV && (w == 0u ? drone[0].note % 12u != CHORD[chord_now][0] : !in_chord(drone[w].note, chord_now)))
+            v = w;
+    if (v == DV) v = 1u + rnd(DV - 1u);         /* all in the chord: one upper voice drifts to a new voicing */
+    voice_to(v, pick_note(v, chord_now, v == DV ? 0 : 1));
+}
+
 /* ---- the screen: the name, the last note big, the keyboard with what sounds, the octave */
 #define C_ACC RGB(120, 170, 90)                 /* moss green */
 #define C_KEY RGB(210, 210, 210)
@@ -112,6 +240,8 @@ static void draw_note(void)
 {
     static const char *const NAME[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
     char s[8] = "-";
+    if (drone_on) { draw_text_box(0, 82, 240, &FONT_L, CHORD_NAME[chord_now], C_ACC, 1); return; }
+    if (last_note > 127u) { lcd_fill(0, 76, 240, 44, C_BLACK); draw_text_box(0, 90, 240, &FONT_S, "press PLAY to grow", C_OFF, 1); return; }
     if (last_note < 128u) {
         const char *p = NAME[last_note % 12u];
         uint32_t i = 0;
@@ -270,6 +400,12 @@ static void app_main(void)
             t_change = fm1_ms;
         }
 
+        if (b & (1u << BTN_PLAY)) {             /* PLAY: grow, or let it fade back into the ground */
+            if (drone_on) drone_on = 0;
+            else grow_start();
+        }
+        grow_tick();
+
         midi_in();
         if (clk_bpm && fm1_ms - clk_t0 > 2000u) clk_bpm = 0, clk_run = 0;   /* the clock has stopped coming */
 
@@ -278,11 +414,15 @@ static void app_main(void)
         for (k = 0; k < NV; k++)                /* what sounds, on the keys of this octave */
             if (voice[k].gate && voice[k].note >= base && voice[k].note < base + 27u)
                 lit |= 1u << (voice[k].note - base);
+        if (drone_on)                           /* the network's notes light up too */
+            for (k = 0; k < DV; k++)
+                if (drone[k].note >= base && drone[k].note < base + 27u)
+                    lit |= 1u << (drone[k].note - base);
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
-        fm1_led_key(BTN_PLAY, clk_run || (clk_bpm && fm1_ms - clk_beat_ms < 80u));   /* lit: running; a blink a beat */
+        fm1_led_key(BTN_PLAY, drone_on || clk_run || (clk_bpm && fm1_ms - clk_beat_ms < 80u));   /* lit: growing */
 #if BOARD_SMK37
         for (k = 0; k < 16u; k++) {             /* a pad glows lilac while its key sounds */
             uint32_t w = k < 8u ? k + 8u : k - 8u, on = lit >> WHITE[w] & 1u;
@@ -293,7 +433,7 @@ static void app_main(void)
 
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
         if (lit != lit_drawn) { lit_drawn = lit; draw_keys(lit); }   /* redraw only what changed */
-        if (last_note != note_drawn) { note_drawn = last_note; draw_note(); }
+        if ((st = drone_on ? 0x10000u | chord_now : last_note) != note_drawn) { note_drawn = st; draw_note(); }
         if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4) != status_drawn) { status_drawn = st; draw_status(oct, set.ch); }
         if ((st = midi_src | clk_bpm << 2 | clk_run << 12) != midi_drawn) { midi_drawn = st; draw_midi(midi_src, clk_bpm, clk_run); }
         idle_ok = 0;
