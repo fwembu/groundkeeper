@@ -433,7 +433,7 @@ static void app_main(void)
 
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
         if (lit != lit_drawn) { lit_drawn = lit; draw_keys(lit); }   /* redraw only what changed */
-        if ((st = drone_on ? 0x10000u | chord_now : last_note) != note_drawn) { note_drawn = st; draw_note(); }
+        if ((st = drone_on ? 1000u + chord_now : last_note) != note_drawn) { note_drawn = st; draw_note(); }
         if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4) != status_drawn) { status_drawn = st; draw_status(oct, set.ch); }
         if ((st = midi_src | clk_bpm << 2 | clk_run << 12) != midi_drawn) { midi_drawn = st; draw_midi(midi_src, clk_bpm, clk_run); }
         idle_ok = 0;
