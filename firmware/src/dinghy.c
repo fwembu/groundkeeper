@@ -156,12 +156,12 @@ static const uint8_t CHORD[6][4] = {            /* pitch classes, root first */
     {0, 4, 7, 11}, {9, 0, 4, 7}, {5, 9, 0, 4}, {2, 5, 9, 0}, {7, 11, 2, 5}, {4, 7, 11, 2}};
 static const char *const CHORD_NAME[6] = {"Cmaj7", "Am7", "Fmaj7", "Dm7", "G7", "Em7"};
 static const uint8_t RANGE_LO[DV] = {40, 52, 57, 62}, RANGE_HI[DV] = {52, 64, 69, 74};   /* E2..E3, E3..E4, ... */
-static uint32_t rng = 0x2545F491u, chord_now, moves_left, t_next_move, grow_ver;
+static uint32_t grow_rng = 0x2545F491u, chord_now, moves_left, t_next_move, grow_ver;
 
 static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
 {
-    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-    return n ? rng % n : 0u;
+    grow_rng ^= grow_rng << 13; grow_rng ^= grow_rng >> 17; grow_rng ^= grow_rng << 5;
+    return n ? grow_rng % n : 0u;
 }
 static uint32_t note_inc(uint32_t note) { return INC_C9[note % 12u] >> (10u - note / 12u); }
 static int in_chord(uint32_t note, uint32_t c)
@@ -197,8 +197,8 @@ static void voice_to(uint32_t v, uint32_t note)
 static void grow_start(void)                    /* PLAY: plant the network (silent, so no glide) */
 {
     uint32_t v;
-    rng ^= fm1_ms * 2654435761u;
-    if (!rng) rng = 1;
+    grow_rng ^= fm1_ms * 2654435761u;
+    if (!grow_rng) grow_rng = 1;
     chord_now = 0;
     for (v = 0; v < DV; v++) drone[v].note = (uint8_t)((RANGE_LO[v] + RANGE_HI[v]) / 2u);
     for (v = 0; v < DV; v++) {
