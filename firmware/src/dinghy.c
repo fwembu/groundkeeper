@@ -54,9 +54,28 @@ static struct {
     volatile uint32_t lfo_inc;                  /* breath speed, per block */
     volatile uint8_t note;
 } drone[DV];
+#define NT 4u                                   /* timbres: MOSS, LOAM, MIST, ROOT */
+static volatile uint32_t tim_now;               /* the timbre (main loop writes) */
+static uint32_t tim_prev, tim_xf = 32767;       /* the crossfade from the last one, Q15 (audio) */
 static volatile int32_t drone_on;               /* 1: growing / sounding, 0: fading to silence */
 static int32_t drone_lvl;                       /* the drone's level now, Q15: fades in and out */
 #define DRONE_GAIN 5200                         /* per voice, Q15: four voices with partials stay under full scale */
+
+static int32_t shape(uint32_t t, uint32_t pa, uint32_t pb, int32_t breath)   /* one sample of timbre t, ~+-32767 */
+{
+    switch (t) {
+    case 1u:                                    /* LOAM: odd harmonics, hollow and dark, like a soft reed */
+        return (sine(pa) + (sine(pb) >> 1) + ((sine(pa * 3u) * 10923) >> 15) + ((sine(pa * 5u) * 4000) >> 15)) >> 1;
+    case 2u:                                    /* MIST: the pair an octave up, the fundamental underneath, airy */
+        return ((sine(pa << 1) + sine(pb << 1) + (sine(pa) >> 1) + (sine(pa * 3u) >> 3)) * 24576) >> 16;
+    case 3u: {                                  /* ROOT: FM, the modulator a hair off: brighter as the voice breathes in */
+        int32_t m = sine(pb);
+        return (sine(pa + (uint32_t)(m * (breath >> 1))) * 24576) >> 15;   /* up to ~0.8 rad of modulation; 3/4 level */
+    }
+    default:                                    /* MOSS: two sines a hair apart and a quiet octave */
+        return (sine(pa) + sine(pb) + (sine(pa << 1) >> 2)) >> 1;
+    }
+}
 
 static void drone_audio(int32_t *out, uint32_t n)
 {
@@ -65,6 +84,11 @@ static void drone_audio(int32_t *out, uint32_t n)
     if (drone_on) { lvl += 48; if (lvl > 32767) lvl = 32767; }   /* fade in ~4 s */
     else { lvl -= 32; if (lvl < 0) lvl = 0; }                     /* fade out ~6 s */
     drone_lvl = lvl;
+    if (tim_now != tim_prev && tim_xf == 32767) tim_xf = 0;   /* (prev: the old one, now: the new one) */
+    if (tim_xf < 32767) {                       /* a new timbre: crossfade over ~0.2 s */
+        tim_xf += 1024;
+        if (tim_xf >= 32767) { tim_xf = 32767; tim_prev = tim_now; }
+    }
     if (!lvl) return;                           /* silent: costs nothing */
     for (v = 0; v < DV; v++) {
         uint32_t pa = drone[v].pa, pb = drone[v].pb, inc = drone[v].inc, tinc = drone[v].tinc, incb;
@@ -80,7 +104,9 @@ static void drone_audio(int32_t *out, uint32_t n)
             int32_t s;
             pa += inc;
             pb += incb;
-            s = (sine(pa) + sine(pb) + (sine(pa << 1) >> 2)) >> 1;   /* two fundamentals, a quiet octave */
+            s = shape(tim_now, pa, pb, breath);
+            if (tim_xf < 32767)
+                s = (s * (int32_t)(tim_xf >> 1) + shape(tim_prev, pa, pb, breath) * (int32_t)((32767u - tim_xf) >> 1)) >> 14;   /* (signed; no overflow) */
             s = (s * g) >> 15;
             out[2u * i] += s;
             out[2u * i + 1u] += s;
@@ -144,6 +170,7 @@ static void stop(uint32_t note)
 static int quiet(void)                          /* nothing sounds, not even a release */
 {
     uint32_t v;
+    if (drone_on || drone_lvl) return 0;        /* the drone is sounding or fading: no flash erase now */
     for (v = 0; v < NV; v++)
         if (voice[v].gate || voice[v].amp) return 0;
     return 1;
@@ -269,14 +296,19 @@ static void draw_keys(uint32_t lit)             /* bit k: key k sounds */
     cv_blit(0, 140);
 }
 
-static void draw_status(int32_t oct, uint32_t ch)
+static const char *const TIM_NAME[NT] = {"MOSS", "LOAM", "MIST", "ROOT"};
+static void draw_status(int32_t oct, uint32_t ch, uint32_t tim)   /* "OCT +0   MOSS   OMNI" */
 {
-    char s[24] = "OCT +0  MIDI OMNI";
+    char s[28] = "OCT +0   ", *p = s + 9;
+    const char *a = TIM_NAME[tim];
     s[4] = oct < 0 ? '-' : '+';
     s[5] = (char)('0' + (oct < 0 ? -oct : oct));
-    if (ch) {
-        s[13] = 'C'; s[14] = 'H'; s[15] = (char)(ch < 10u ? ' ' : '1'); s[16] = (char)('0' + ch % 10u);
-    }
+    while (*a) *p++ = *a++;
+    *p++ = ' '; *p++ = ' '; *p++ = ' ';
+    if (ch) { *p++ = 'C'; *p++ = 'H'; if (ch >= 10u) *p++ = '1'; *p++ = (char)('0' + ch % 10u); }
+    else { a = "OMNI"; while (*a) *p++ = *a++; }
+    *p = 0;
+    lcd_fill(0, 208, 240, 24, C_BLACK);
     draw_text_box(0, 212, 240, &FONT_S, s, C_OFF, 1);
 }
 
@@ -300,7 +332,7 @@ static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)   /* where n
 }
 
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
-static struct { uint8_t oct, ch; } set = {0, 0};   /* what survives a power-off (add yours, up to SECTOR_MAX bytes) */
+static struct { uint8_t oct, ch, tim; } set = {0, 0, 0};   /* what survives a power-off (add yours, up to SECTOR_MAX bytes) */
 static uint32_t idle_ok, midi_src, clk_n, clk_t0, clk_bpm, clk_run, clk_beat_ms;
 
 static void midi_in(void)
@@ -345,9 +377,10 @@ static void app_main(void)
     smk_pw_t wheel = {0};
     smk_pad_events = 1;                         /* the pads as events (smk_pad_take): they play here, lit while they sound */
 #endif
-    if (settings_load(&set, sizeof set) || (int8_t)set.oct < -2 || (int8_t)set.oct > 2 || set.ch > 16u)
-        set.oct = 0, set.ch = 0;
+    if (settings_load(&set, sizeof set) || (int8_t)set.oct < -2 || (int8_t)set.oct > 2 || set.ch > 16u || set.tim >= NT)
+        set.oct = 0, set.ch = 0, set.tim = 0;
 
+    tim_now = tim_prev = set.tim;
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 18, 240, &FONT_L, APP_NAME, C_ACC, 1);
     draw_text_box(0, 52, 240, &FONT_S, "the ground layer  v" APP_VER, C_OFF, 1);
@@ -393,6 +426,12 @@ static void app_main(void)
         b = fm1_input_edges(&rel);              /* buttons pressed since the last call (bit = button id) */
         if (b & (1u << BTN_OCT_DOWN) && oct > -2) { set.oct = (uint8_t)(oct - 1); dirty = 1; t_change = fm1_ms; }
         if (b & (1u << BTN_OCT_UP) && oct < 2) { set.oct = (uint8_t)(oct + 1); dirty = 1; t_change = fm1_ms; }
+        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the timbre, round the ring */
+            set.tim = (uint8_t)(((int32_t)set.tim + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
+            tim_now = set.tim;
+            dirty = 1;
+            t_change = fm1_ms;
+        }
         if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {   /* detents turned since the last call */
             int32_t c = (int32_t)set.ch + e;
             set.ch = (uint8_t)(c < 0 ? 0 : c > 16 ? 16 : c);
@@ -434,7 +473,7 @@ static void app_main(void)
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
         if (lit != lit_drawn) { lit_drawn = lit; draw_keys(lit); }   /* redraw only what changed */
         if ((st = drone_on ? 1000u + chord_now : last_note) != note_drawn) { note_drawn = st; draw_note(); }
-        if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4) != status_drawn) { status_drawn = st; draw_status(oct, set.ch); }
+        if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4 | (uint32_t)set.tim << 9) != status_drawn) { status_drawn = st; draw_status(oct, set.ch, set.tim); }
         if ((st = midi_src | clk_bpm << 2 | clk_run << 12) != midi_drawn) { midi_drawn = st; draw_midi(midi_src, clk_bpm, clk_run); }
         idle_ok = 0;
 
