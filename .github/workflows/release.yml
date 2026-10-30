@@ -41,10 +41,16 @@ jobs:
 
       - name: Build (the SMK-37 first, the FM-1 last, as the tests expect)
         run: |
-          BOARD=smk37 sh build.sh
-          BOARD=smk37 MODEL=elite sh build.sh
-          BOARD=smk37 MODEL=mke sh build.sh
-          sh build.sh
+          set -o pipefail
+          ( BOARD=smk37 sh build.sh &&
+            BOARD=smk37 MODEL=elite sh build.sh &&
+            BOARD=smk37 MODEL=mke sh build.sh &&
+            sh build.sh ) 2>&1 | tee build.log
+
+      - name: Report a failed build as an annotation (readable without the full log)
+        if: failure()
+        run: |
+          tail -n 40 build.log | python3 -c "import sys; print('::error title=build failed::' + sys.stdin.read().replace('%','%25').replace('\r','').replace('\n','%0A'))"
 
       - name: Host tests
         run: sh tests/run_tests.sh
