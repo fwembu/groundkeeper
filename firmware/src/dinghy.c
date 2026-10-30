@@ -15,6 +15,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV.
  * What platform.c offers: docs/API.md. The chip's rules: docs/RULES.md. */
+#define APP_NAME "GROUNDKEEPER"                /* the title, the rescue and the crash screen */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: MIDI in (platform.c) */
 #include "platform.c"
@@ -101,7 +102,7 @@ static int quiet(void)                          /* nothing sounds, not even a re
 }
 
 /* ---- the screen: the name, the last note big, the keyboard with what sounds, the octave */
-#define C_ACC RGB(180, 140, 255)                /* lilac, as the logo */
+#define C_ACC RGB(120, 170, 90)                 /* moss green */
 #define C_KEY RGB(210, 210, 210)
 #define C_OFF RGB(90, 90, 90)
 #define KEY0 53u                                /* key 0 = F3 */
@@ -219,7 +220,7 @@ static void app_main(void)
 
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 18, 240, &FONT_L, APP_NAME, C_ACC, 1);
-    draw_text_box(0, 52, 240, &FONT_S, "a sine to build on  v" APP_VER, C_OFF, 1);
+    draw_text_box(0, 52, 240, &FONT_S, "the ground layer  v" APP_VER, C_OFF, 1);
 
     for (;;) {
         uint32_t keys, down, up, rel, b, lit = 0, out_ch = set.ch ? set.ch - 1u : 0u, st;

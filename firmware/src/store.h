@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 #ifndef STORE_MAGIC
-#define STORE_MAGIC 0x59474E44u                 /* "DNGY": settings and blobs (slots: "SLOT"); your fork: your own */
+#define STORE_MAGIC 0x504B5247u                 /* "GRKP": settings and blobs (slots: "SLOT"); your fork: your own */
 #endif
 #define NBLOB 8u                                /* blobs: one 4 KiB sector each */
 #define NSLOT 8u                                /* slots: SLOT_SECT sectors each, for something bigger (samples, songs) */
