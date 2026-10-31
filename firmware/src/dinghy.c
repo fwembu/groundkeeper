@@ -46,9 +46,9 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
 /* ---- Groundkeeper's voices (audio ISR; the decisions are in the main loop)
  * DV voices, each two oscillators a few cents apart (a slow beat) in one of five timbres, with its own slow "breath".
  * The main loop sets a voice's target pitch; here the pitch glides there over a second or two.
- * Two engines. DRONE: a voice that is part of the network grows in (ATTACK) and holds; one that is not withers away
- * (RELEASE). BLOOM: a voice sounds only when the main loop triggers it: it swells to its peak (ATTACK), then fades
- * (RELEASE), and leaves silence until the next one. */
+ * Two ways to sound. Held (UMWELT DRONE): a voice that is part of the network grows in (ATTACK) and holds; one that is
+ * not withers away (RELEASE). Triggered (UMWELT STABS, BLOOM): a voice sounds only when the main loop triggers it: it
+ * rises to its peak (ATTACK), then fades (RELEASE), and leaves silence until the next one. */
 #include "gk_tables.h"
 #define DV 6u                                   /* the most voices the network can grow (density 6) */
 static struct {
@@ -67,7 +67,8 @@ static struct {
 #define NT 5u                                   /* timbres: MOSS, MIST, CHOIR, ORGAN, REED */
 static volatile uint32_t tim_now;               /* the timbre (main loop writes) */
 static uint32_t tim_prev, tim_xf = 32767;       /* the crossfade from the last one, Q15 (audio) */
-static volatile uint32_t engine;                /* 0 DRONE, 1 BLOOM (main loop writes) */
+static volatile uint32_t engine;                /* 0: voices hold (DRONE); 1: voices are triggered (STABS, BLOOM) */
+static volatile uint32_t trig_boost;            /* BLOOM: each voice twice as loud (main loop writes) */
 static volatile uint32_t env_att = 63, env_rel = 218;   /* the envelope (ATT_INC, REL_K values; main loop writes) */
 static volatile uint32_t wob_depth;             /* WOBBLE: Q16 of the pitch (main loop writes) */
 static volatile int32_t drone_on;               /* 1: growing / sounding, 0: fading to silence */
@@ -106,7 +107,7 @@ static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to
 {
     uint32_t v, i, eng = engine, att = env_att, rel = env_rel, tn = tim_now, tp;
     int32_t lvl = drone_lvl, wob;
-    if (drone_on) { lvl += 48; if (lvl > 32767) lvl = 32767; }   /* fade in ~4 s */
+    if (drone_on) { lvl += engine ? 4096 : 48; if (lvl > 32767) lvl = 32767; }   /* fade in ~4 s (a groove: at once) */
     else { lvl -= 32; if (lvl < 0) lvl = 0; }                     /* fade out ~6 s */
     drone_lvl = lvl;
     if (tn != tim_prev && tim_xf == 32767) tim_xf = 0;   /* (prev: the old one, now: the new one) */
@@ -147,7 +148,7 @@ static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to
         drone[v].lfo += drone[v].lfo_inc;
         breath = 24576 + ((sine(drone[v].lfo) * 8192) >> 15);   /* 0.5 .. 1.0 */
         g = (((((((DRONE_GAIN * breath) >> 15) * (int32_t)TGAIN[tn]) >> 15) * lvl) >> 15) * va) >> 15;
-        if (eng) g <<= 1;                       /* BLOOM: a voice or two at a time, so each twice as loud */
+        if (trig_boost) g <<= 1;                /* BLOOM: a voice or two at a time, so each twice as loud */
         step = (g - g0) / (int32_t)n;           /* the gain ramps across the block: no steps, even on a fast attack */
         for (i = 0; i < n; i++) {
             int32_t s;
@@ -374,20 +375,49 @@ static int quiet(void)                          /* nothing sounds, not even a re
     return 1;
 }
 
-/* ---- Groundkeeper's growth (main loop): which chord the network holds, and how its voices drift.
- * Six chords in C major, in a ring where neighbours share three notes, so every step is a small one.
- * Every few seconds one voice moves to a note of the current chord; every few moves the chord steps along the ring. */
-static const uint8_t CHORD[6][5] = {            /* in C, as pitch classes: root, three chord tones, a colour (9th; 11th on iii) */
-    {0, 4, 7, 11, 2}, {9, 0, 4, 7, 11}, {5, 9, 0, 4, 7}, {2, 5, 9, 0, 4}, {7, 11, 2, 5, 9}, {4, 7, 11, 2, 9}};
-static const char *const QUAL[6] = {"maj7", "m7", "maj7", "m7", "7", "m7"};   /* I vi IV ii V iii */
-static const uint8_t FIFTHS[12] = {0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5};   /* the keys round the circle of fifths: C G D ... F */
-static const char *const KEY_NAME[12] = {"C", "G", "D", "A", "E", "B", "F#", "Db", "Ab", "Eb", "Bb", "F"};
+/* ---- Groundkeeper's spells (main loop): the harmony the network holds, and how it moves.
+ * A SCALE is a root and a mode. A SPELL is a group of scales that belong together, with a name; the groundkeeper casts
+ * one from the BOOK. The season moves the harmony between a spell's scales: WHEEL walks round the circle of fifths a
+ * step at a time; the other spells leap, to any of their scales. A move pivots: the new scale's chord that shares the
+ * most with the one sounding takes over, so a change slips in rather than jumps; at the next pulse the harmony goes home,
+ * to the new scale's first chord: the turn is felt (in STILLWATER the notes stay, only the centre moves).
+ * Chords stack every other note of the scale (thirds in a seven-note scale; open, quartal sounds in a pentatonic):
+ * root, three tones, and a colour (the 9th) for the two highest voices. They come in a ring that falls by a third, so
+ * neighbours share three notes; the tense half-diminished and diminished chords are left out of the ring. */
+#define NMODE 10u
+enum { M_MAJ, M_DOR, M_PHR, M_LYD, M_MIX, M_MIN, M_HMIN, M_MMIN, M_PENT, M_MPENT };
+static const uint8_t MODE_N[NMODE] = {7, 7, 7, 7, 7, 7, 7, 7, 5, 5};
+static const uint8_t MODE_PC[NMODE][7] = {{0, 2, 4, 5, 7, 9, 11}, {0, 2, 3, 5, 7, 9, 10}, {0, 1, 3, 5, 7, 8, 10},
+    {0, 2, 4, 6, 7, 9, 11}, {0, 2, 4, 5, 7, 9, 10}, {0, 2, 3, 5, 7, 8, 10}, {0, 2, 3, 5, 7, 8, 11}, {0, 2, 3, 5, 7, 9, 11},
+    {0, 2, 4, 7, 9}, {0, 3, 5, 7, 10}};
+static const char *const MODE_NAME[NMODE] = {"MAJOR", "DORIAN", "PHRYGIAN", "LYDIAN", "MIXOLYD", "MINOR", "HARM MIN",
+    "MEL MIN", "PENTA", "MIN PENT"};
+typedef struct { const char *name; uint8_t walk, n, off[12], mode[12]; } spell_t;   /* off: from the tonic, semitones */
+#define NSPELL 6u
+static const spell_t SPELL[NSPELL] = {
+    {"WHEEL", 1, 12, {0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5}, {0}},                       /* the twelve major keys, by fifths */
+    {"STILLWATER", 0, 6, {0, 2, 4, 5, 7, 9}, {M_MAJ, M_DOR, M_PHR, M_LYD, M_MIX, M_MIN}},   /* one set of notes, six centres */
+    {"HOLLOW", 0, 5, {0, 0, 0, 0, 0}, {M_MIN, M_DOR, M_HMIN, M_MMIN, M_PHR}},              /* the minors on one root */
+    {"MEADOW", 0, 4, {0, 0, 0, 7}, {M_LYD, M_MAJ, M_MIX, M_LYD}},                           /* bright: lydian light */
+    {"FAE RING", 0, 6, {0, 4, 8, 9, 1, 5}, {M_MAJ, M_MAJ, M_MAJ, M_MIN, M_MIN, M_MIN}},     /* keys a third apart */
+    {"OLD SONG", 0, 4, {0, 7, 5, 0}, {M_PENT, M_PENT, M_PENT, M_MPENT}}};                   /* pentatonic, open */
+static const char *const SPELL_SHORT[NSPELL] = {"WHEEL", "STILL", "HOLLOW", "MEADOW", "FAE", "OLDSONG"};   /* (the knob panel) */
+static const uint8_t FIFTHS[12] = {0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5};   /* the tonics round the circle of fifths */
+static const char *const PC_NAME[12] = {"C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"};
+static const char *const TONIC_NAME[12] = {"C", "G", "D", "A", "E", "B", "F#", "Db", "Ab", "Eb", "Bb", "F"};
+
 static const uint8_t WIN_C[DV] = {46, 58, 63, 68, 73, 78};   /* each voice's window centre at full SPREAD: E2..E3 up to C5..C6 */
 static const uint8_t RANK[DV] = {0, 2, 1, 3, 4, 5};   /* the order voices grow in: the root, the middle, the low, the high, the colours */
-static uint32_t grow_rng = 0x2545F491u, chord_now, key_now, moves_left, grow_ver, density = 4u, pulse_ms;
+static uint32_t grow_rng = 0x2545F491u, chord_now, moves_left, grow_ver, density = 4u, pulse_ms;
+static uint32_t spell_now, tonic, scale_now;    /* the spell cast, its tonic (on the circle of fifths), its scale now */
+static uint8_t scale_pc[7], ring[7];            /* the scale now: its notes; its chords' degrees, in ring order */
+static uint32_t scale_n, ring_n;
 static int32_t spread = 8, pitch;               /* SPREAD 0..8 (8: the windows above), PITCH -12..+12 semitones */
 static uint32_t chord_every = 5u;               /* CHORDS: pulses a chord (0: HOLD) */
 static uint32_t bloom_t[DV];                    /* BLOOM: when each voice last bloomed (fm1_ms) */
+static uint32_t eng_sel;                        /* 0 UMWELT, 1 BLOOM (SEL; UMWELT at every power-on) */
+static uint32_t um_mode;                        /* UMWELT: 0 DRONE, 1 STABS */
+static int homing;                              /* a new scale: at the next pulse, its home chord */
 
 static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
 {
@@ -395,7 +425,38 @@ static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
     return n ? grow_rng % n : 0u;
 }
 static uint32_t note_inc(uint32_t note) { return INC_C9[note % 12u] >> (10u - note / 12u); }
-static uint32_t cpc(uint32_t c, uint32_t k) { return (CHORD[c][k] + FIFTHS[key_now]) % 12u; }   /* chord c's k-th pitch class, in the key now */
+static void scale_load(void)                    /* the scale now: its notes, and its ring of chords */
+{
+    const spell_t *sp = &SPELL[spell_now];
+    uint32_t m = sp->mode[scale_now], root = (FIFTHS[tonic] + sp->off[scale_now]) % 12u, i, j;
+    scale_n = MODE_N[m];
+    for (i = 0; i < scale_n; i++) scale_pc[i] = (uint8_t)((root + MODE_PC[m][i]) % 12u);
+    ring_n = 0;
+    for (j = 0; j < scale_n; j++) {             /* falling by thirds: 0, n-2, n-4, ... */
+        uint32_t d = (scale_n * 2u - 2u * j) % scale_n, k, seen = 0, t, f;
+        for (k = 0; k < ring_n; k++) seen |= ring[k] == d;
+        if (seen) break;
+        t = (scale_pc[(d + 2u) % scale_n] + 12u - scale_pc[d]) % 12u;
+        f = (scale_pc[(d + 4u) % scale_n] + 12u - scale_pc[d]) % 12u;
+        if ((t == 3u || t == 4u) && f == 6u) continue;   /* (half-diminished, diminished: left out) */
+        ring[ring_n++] = (uint8_t)d;
+    }
+}
+static uint32_t cpc(uint32_t c, uint32_t k)     /* chord c's k-th pitch class: 0 root, 1..3 its tones, 4 its colour */
+{
+    uint32_t d = ring[c % ring_n];
+    return scale_pc[(d + (k < 4u ? 2u * k : 8u)) % scale_n];
+}
+static const char *chord_qual(uint32_t c)       /* maj7, m7, 7, ... from the chord's intervals ("" if it has no name) */
+{
+    static const struct { uint8_t t, f, s; const char *q; } Q[] = {{4, 7, 11, "maj7"}, {3, 7, 10, "m7"}, {4, 7, 10, "7"},
+        {3, 7, 11, "mMaj7"}, {4, 8, 11, "maj7#5"}, {4, 9, 2, "6/9"}, {5, 10, 2, "9sus"}, {5, 10, 3, "7sus"}, {5, 9, 2, "6sus"},
+        {3, 10, 5, "m11"}, {4, 7, 9, "6"}, {3, 7, 9, "m6"}};
+    uint32_t r = cpc(c, 0), t = (cpc(c, 1) + 12u - r) % 12u, f = (cpc(c, 2) + 12u - r) % 12u, s = (cpc(c, 3) + 12u - r) % 12u, i;
+    for (i = 0; i < sizeof Q / sizeof Q[0]; i++)
+        if (Q[i].t == t && Q[i].f == f && Q[i].s == s) return Q[i].q;
+    return "";
+}
 static int alive(uint32_t v) { return RANK[v] < density; }
 static uint32_t win_lo(uint32_t v)              /* the lowest note of voice v's window (12 semitones wide) */
 {
@@ -420,7 +481,7 @@ static int held_by_other(uint32_t pc, uint32_t v)   /* another living upper voic
     for (w = 1; w < DV; w++) if (w != v && alive(w) && drone[w].note % 12u == pc) return 1;
     return 0;
 }
-static uint32_t pick_note(uint32_t v, uint32_t c, int fresh)   /* a chord note in v's range, near where v is */
+static uint32_t pick_note(uint32_t v, uint32_t c, int fresh)   /* a chord note in v's window, near where v is */
 {
     uint32_t n, pass, best = drone[v].note, bestd = 0xFFFFu;
     for (pass = 0; pass < 3u && bestd == 0xFFFFu; pass++)   /* 0: every rule; 1: may double a pitch class; 2: may stay */
@@ -457,58 +518,86 @@ static void revoice(void)                       /* SPREAD or PITCH moved: every 
     uint32_t v;
     for (v = 0; v < DV; v++)
         if (alive(v)) voice_to(v, pick_note(v, chord_now, 0));
-#ifdef DINGHY_HOST
-    printf("%7u ms  revoice (spread %d, pitch %+d):", (unsigned)fm1_ms, (int)spread, (int)pitch);
-    for (v = 0; v < DV; v++) if (alive(v)) printf(" %u", (unsigned)drone[v].note);
-    printf("\n");
-#endif
 }
-static void key_step(int32_t dir)               /* one step round the circle of fifths (+1 sharpwards), through a pivot */
+static void cast(uint32_t sp, uint32_t tn, uint32_t sc)   /* to this spell, tonic and scale, pivoting on the chord sounding */
 {
-    uint32_t old[4], c, k, j, best = chord_now, bests = 0;
-    for (k = 0; k < 4u; k++) old[k] = cpc(chord_now, k);
-    key_now = (key_now + (dir > 0 ? 1u : 11u)) % 12u;
-    for (c = 0; c < 6u; c++) {                  /* the new key's chord sharing the most with the one sounding: often the same */
-        uint32_t sc = 0;
-        for (k = 0; k < 4u; k++) for (j = 0; j < 4u; j++) sc += cpc(c, k) == old[j];
-        sc = sc * 2u + (cpc(c, 0) == old[0]);   /* (the same root breaks a tie) */
-        if (sc > bests) { bests = sc; best = c; }
+    uint32_t old[4], c, k, j, best = 0, bests = 0;
+    for (k = 0; k < 4u; k++) old[k] = ring_n ? cpc(chord_now, k) : 0u;
+    spell_now = sp; tonic = tn; scale_now = sc % SPELL[sp].n;
+    scale_load();
+    for (c = 0; c < ring_n; c++) {              /* the new scale's chord sharing the most with the one sounding: often the same */
+        uint32_t s = 0;
+        for (k = 0; k < 4u; k++) for (j = 0; j < 4u; j++) s += cpc(c, k) == old[j];
+        s = s * 2u + (cpc(c, 0) == old[0]);     /* (the same root breaks a tie) */
+        if (s > bests) { bests = s; best = c; }
     }
     chord_now = best;
 #ifdef DINGHY_HOST
-    printf("%7u ms  season: key %s, pivot chord %u\n", (unsigned)fm1_ms, KEY_NAME[key_now], (unsigned)best);
+    printf("%7u ms  cast: %s, %s %s, pivot %s%s\n", (unsigned)fm1_ms, SPELL[sp].name, PC_NAME[scale_pc[0]],
+           MODE_NAME[SPELL[sp].mode[scale_now]], PC_NAME[cpc(best, 0)], chord_qual(best));
 #endif
-    moves_left = new_moves();                   /* rest on the pivot a while before the new key's chords move on */
+    homing = 1;                                 /* (on the pivot until the next pulse; then home) */
     grow_ver++;
 }
-static void bloom(void)                         /* BLOOM: one living voice blooms on a note of the chord */
+static int32_t season_dir = 1;                  /* WHEEL: +1 travelling sharpwards round the circle, -1 flatwards */
+static void season_turn(void)                   /* the season moves the harmony: WHEEL a step (mostly onward), the rest a leap */
+{
+    const spell_t *sp = &SPELL[spell_now];
+    uint32_t to;
+    if (sp->n < 2u) return;
+    if (sp->walk) {
+        if (!rnd(3u)) season_dir = -season_dir;
+        to = (scale_now + (season_dir > 0 ? 1u : sp->n - 1u)) % sp->n;
+    } else
+        to = (scale_now + 1u + rnd(sp->n - 1u)) % sp->n;   /* any other of the spell's scales */
+    cast(spell_now, tonic, to);
+}
+
+/* the sound events: a STAB (UMWELT, every living voice at once) or a BLOOM (one voice), on a hit of the cycle */
+static void stab(int accent)
+{
+    uint32_t v;
+    for (v = 0; v < DV; v++)
+        if (alive(v)) {
+            drone[v].peak = accent ? 32767 : 23000 + (int32_t)rnd(5000u);
+            drone[v].trig++;
+        }
+}
+static void bloom(int accent)                   /* one living voice blooms on a note of the chord: a free one, else the oldest */
 {
     uint32_t v, n = 0, pick = DV;
     for (v = 0; v < DV; v++)                    /* a voice that has nearly faded is free */
         if (alive(v) && drone[v].vamp < 1500) n++;
-    if (n) {                                    /* a free one, at random */
+    if (n) {
         n = rnd(n);
         for (v = 0; v < DV; v++)
             if (alive(v) && drone[v].vamp < 1500 && !n--) { pick = v; break; }
-    } else                                      /* none free: the one that bloomed longest ago */
+    } else
         for (v = 0; v < DV; v++)
             if (alive(v) && (pick == DV || (int32_t)(bloom_t[v] - bloom_t[pick]) < 0)) pick = v;
     if (pick == DV) return;
     voice_to(pick, pick_note(pick, chord_now, 1));
-    drone[pick].peak = 20000 + (int32_t)rnd(12768u);   /* each bloom a little different */
+    drone[pick].peak = accent ? 32767 : 18000 + (int32_t)rnd(12000u);   /* each bloom a little different */
     bloom_t[pick] = fm1_ms;
     drone[pick].trig++;                         /* (last: the audio starts it with the note and peak above) */
 }
-static void pulse_move(void)                    /* a pulse through the network: one voice moves (or blooms); now and then the chord */
+static void pulse_move(void)                    /* a pulse through the network: now and then the chord; a voice moves */
 {
     uint32_t v, w, n;
     pulse_ms = fm1_ms;
-    if (chord_every && !moves_left) {           /* the network shifts: a neighbour on the ring (CHORDS: HOLD never) */
-        chord_now = (chord_now + (rnd(3u) ? 1u : 5u)) % 6u;
+    if (homing) {                               /* a new scale: home (also with CHORDS on HOLD) */
+        homing = 0;
+        chord_now = 0;
+        moves_left = new_moves();
+    } else if (chord_every && !moves_left) {    /* the network shifts: a neighbour on the ring (CHORDS: HOLD never) */
+        chord_now = (chord_now + (rnd(3u) ? 1u : ring_n - 1u)) % ring_n;
         moves_left = new_moves();
     }
     if (moves_left) moves_left--;
-    if (engine) { bloom(); return; }
+#ifdef DINGHY_HOST
+    printf("%7u ms  chord %s%s\n", (unsigned)fm1_ms, PC_NAME[cpc(chord_now, 0)], chord_qual(chord_now));
+#endif
+    if (eng_sel) return;                        /* (BLOOM picks its notes as it blooms) */
     for (w = 0, v = DV; w < DV && v == DV; w++) /* a living voice outside the chord (or its window) moves first, the bass first */
         if (alive(w) && !fits(w, chord_now)) v = w;
     if (v < DV) { voice_to(v, pick_note(v, chord_now, 0)); return; }
@@ -519,23 +608,26 @@ static void pulse_move(void)                    /* a pulse through the network: 
         if (alive(w) && !n--) { voice_to(w, pick_note(w, chord_now, 1)); return; }
 }
 
-/* ---- the LFOs (main loop, per ms; nothing here runs in the audio ISR)
- * PULSE moves the voicings: a move each time its wave rises through the middle. SINE: regular; RANDOM: a smooth random
- * wave (a new target each quarter cycle, a raised-cosine glide to it), so the moves come irregularly; MIX: the two summed.
- * SEASON (OFF, 15 s .. 10 min in 15 s steps) moves the key: a slow random wave; each time it peaks high or dips low, the key takes a step round the circle
- * of fifths. It keeps travelling the same way, turning back a third of the time, so over the hours it wanders through
- * the keys (high = sharpwards, low = flatwards made a pendulum between two keys). Its cycle is 0.7 of the setting: a
- * key change comes about once per setting, on average. */
+/* ---- time (main loop): TEMPO in BPM; the PULSE and SEASON waves; the CYCLE.
+ * PULSE moves the voicings, a move each time its wave rises through the middle; its length is in beats (1/4 .. 64).
+ * SINE: regular, on the beat; RANDOM: a smooth random wave (a new target each quarter cycle), so the moves come
+ * irregularly; MIX: the two summed. SEASON (OFF, 15 s .. 10 min in 15 s steps) is a slow random wave: each time it
+ * peaks or dips, the season turns (season_turn). Its cycle is 0.7 of the setting: a turn about once per setting.
+ * The CYCLE is the groove: STEPS steps of RATE (1/4 .. 1/32, triplets too), HITS of them spread as evenly as they go
+ * (a Euclidean rhythm), turned by ROTATE; the first step is the accent. Each hit is a STAB or a BLOOM. */
 typedef struct { uint32_t ph; int32_t a, b; uint8_t seg, armed, zone; } lfo_t;   /* seg: log2 of random targets a cycle */
 static lfo_t pulse = {0, 0, 0, 2, 0, 0}, season = {0, 0, 0, 1, 0, 0};
 static uint32_t lfo_t0;
-static int32_t season_dir = 1;                  /* +1: travelling sharpwards round the circle, -1: flatwards */
-#define NPULSE 12u
-static const uint16_t PULSE_S[NPULSE] = {0, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};   /* seconds a cycle; 0: STILL */
+#define NPULSE 15u
+static const uint16_t PULSE_Q[NPULSE] = {0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256};   /* quarter beats; 0: STILL */
+static const char *const PULSE_LABEL[NPULSE] = {"STILL", "1/4", "1/2", "1", "2", "3", "4", "6", "8", "12", "16", "24", "32", "48", "64"};
 #define NSHAPE 3u
 static const char *const SHAPE_NAME[NSHAPE] = {"SINE", "MIX", "RANDOM"};
 #define NSEASON 41u                             /* OFF, then 15 s .. 10 min in 15 s steps */
 #define SEASON_S(i) ((uint32_t)(i) * 15u)
+#define NRATE 6u
+static const uint8_t RATE_N[NRATE] = {1, 2, 3, 4, 6, 8};   /* cycle steps a beat */
+static const char *const RATE_LABEL[NRATE] = {"1/4", "1/8", "1/8T", "1/16", "16T", "1/32"};
 
 static int lfo_advance(lfo_t *l, uint32_t dt, uint32_t ms)   /* 1: a new random segment began (pick the next target) */
 {
@@ -560,7 +652,7 @@ static void lfo_reset(void)                     /* PLAY: both waves start from t
     season_dir = rnd(2u) ? 1 : -1;
     lfo_t0 = fm1_ms;
 }
-static int lfo_tick(uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 when SEASON moved the key */
+static int lfo_tick(uint32_t bpm, uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 when the season turned */
 {
     uint32_t dt = fm1_ms - lfo_t0;
     int32_t v;
@@ -568,29 +660,49 @@ static int lfo_tick(uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 whe
     lfo_t0 = fm1_ms;
     if (!drone_on || !dt) return 0;
     if (dt > 500u) dt = 500u;                   /* (after a stall: no leap) */
-    if (lfo_advance(&pulse, dt, PULSE_S[pul] * 1000u)) lfo_target(&pulse);
-    if (PULSE_S[pul]) {
+    if (lfo_advance(&pulse, dt, PULSE_Q[pul] * 15000u / bpm)) lfo_target(&pulse);
+    if (PULSE_Q[pul]) {
         v = shp == 0u ? sine(pulse.ph) : shp == 2u ? lfo_random(&pulse) : (sine(pulse.ph) + lfo_random(&pulse)) >> 1;
         if (v < -4000) pulse.armed = 1;         /* (below the middle first: one move per rise) */
         else if (v > 0 && pulse.armed) { pulse.armed = 0; pulse_move(); }
     }
     if (lfo_advance(&season, dt, SEASON_S(sea) * 700u)) lfo_target(&season);
     if (sea) {
-        v = lfo_random(&season);
         int ev = 0;
+        v = lfo_random(&season);
         if (season.zone != 1u && v > 16384) { season.zone = 1; ev = 1; }
         else if (season.zone != 2u && v < -16384) { season.zone = 2; ev = 1; }
         else if ((season.zone == 1u && v < 8192) || (season.zone == 2u && v > -8192)) season.zone = 0;
-        if (ev) {                               /* a peak or a dip: a step, mostly onward */
-            if (!rnd(3u)) season_dir = -season_dir;
-            key_step(season_dir);
-            moved = 1;
-        }
+        if (ev) { season_turn(); moved = 1; }
     }
     return moved;
 }
 
-static void grow_start(void)                    /* PLAY: plant the network on the key's home chord */
+static uint32_t cyc_next, cyc_step, hit_ms;     /* the cycle: the next step's time (ms x16), its index; the last hit */
+static int euclid(uint32_t i, uint32_t steps, uint32_t hits, uint32_t rot)   /* step i is a hit */
+{
+    if (!hits) return 0;
+    if (hits >= steps) return 1;
+    return ((i + steps - rot % steps) % steps) * hits % steps < hits;
+}
+static void cycle_tick(uint32_t bpm, uint32_t rate, uint32_t steps, uint32_t hits, uint32_t rot, uint32_t chance)
+{
+    uint32_t now = fm1_ms << 4, len = 960000u / (bpm * RATE_N[rate]);   /* a step, in ms x16 */
+    if (!drone_on || (!eng_sel && !um_mode)) { cyc_next = now; cyc_step = 0; return; }   /* (UMWELT DRONE: no cycle) */
+    if ((int32_t)(now - cyc_next) > 16000) cyc_next = now;   /* (after a stall: back on time, no burst) */
+    while ((int32_t)(now - cyc_next) >= 0) {
+        if (cyc_step >= steps) cyc_step = 0;
+        if (euclid(cyc_step, steps, hits, rot) && (!eng_sel || rnd(20u) < chance)) {
+            hit_ms = fm1_ms;
+            if (eng_sel) bloom(cyc_step == 0u);
+            else stab(cyc_step == 0u);
+        }
+        cyc_step = (cyc_step + 1u) % steps;
+        cyc_next += len;
+    }
+}
+
+static void grow_start(void)                    /* PLAY: plant the network on the scale's home chord */
 {
     uint32_t v;
     grow_rng ^= fm1_ms * 2654435761u;
@@ -603,7 +715,9 @@ static void grow_start(void)                    /* PLAY: plant the network on th
         drone[v].lfo_inc = 4294967295u / (172u * (7u + rnd(13u)));   /* a breath every 7..19 s */
     }
     moves_left = new_moves();
+    homing = 0;
     lfo_reset();
+    cyc_next = fm1_ms << 4; cyc_step = 0;
     drone_on = 1;
     set_density(density);
 }
@@ -613,91 +727,63 @@ static void grow_stop(void)                     /* PLAY again: the whole network
     grow_ver++;
 }
 
-/* ---- the screen: the name, the last note big, the keyboard with what sounds, the octave */
-#define C_ACC RGB(120, 170, 90)                 /* moss green */
-#define C_KEY RGB(210, 210, 210)
-#define C_OFF RGB(90, 90, 90)
-#define KEY0 53u                                /* key 0 = F3 */
-static int black(uint32_t note) { return (0x54Au >> (note % 12u)) & 1u; }
-
-static void draw_note(void)
-{
-    static const char *const NAME[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-    char s[8] = "-";
-    if (drone_on) {                             /* the chord: its root big, the accidental and the quality small */
-        static const char *const SHARP[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-        static const char *const FLAT[12] = {"C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"};
-        const char *nm = (key_now >= 7u ? FLAT : SHARP)[cpc(chord_now, 0)], *q = QUAL[chord_now];
-        char root[2] = {nm[0], 0};
-        int32_t x = (240 - (text_w(&FONT_L, root) + text_w(&FONT_S, nm + 1) + 2 + text_w(&FONT_S, q))) / 2;
-        cv_begin(240, 32, C_BLACK);
-        x = cv_text(x, 0, &FONT_L, root, C_ACC);
-        x = cv_text(x, 1, &FONT_S, nm + 1, C_ACC) + 2;   /* # or b, raised */
-        cv_text(x, 15, &FONT_S, q, C_ACC);      /* maj7, m7, 7: on the line */
-        cv_blit(0, 82);
-        return;
-    }
-    if (last_note > 127u) { lcd_fill(0, 76, 240, 44, C_BLACK); draw_text_box(0, 90, 240, &FONT_S, "press PLAY to grow", C_OFF, 1); return; }
-    if (last_note < 128u) {
-        const char *p = NAME[last_note % 12u];
-        uint32_t i = 0;
-        while (*p) s[i++] = *p++;
-        if (last_note >= 12u) s[i++] = (char)('0' + last_note / 12u - 1u);
-        s[i] = 0;
-    }
-    draw_text_box(0, 82, 240, &FONT_L, s, C_WHITE, 1);
-}
-
-static void draw_keys(uint32_t lit)             /* bit k: key k sounds */
-{
-    uint32_t k, w = 0;
-    cv_begin(240, 56, C_BLACK);
-    for (k = 0; k < 27u; k++)                   /* 16 white keys of 14 px from x = 8 */
-        if (!black(KEY0 + k)) {
-            cv_rect(8 + (int32_t)w * 14, 0, 13, 56, lit >> k & 1u ? C_ACC : C_KEY);
-            w++;
-        }
-    for (k = 0, w = 0; k < 27u; k++)            /* the black ones on the line between two white */
-        if (black(KEY0 + k))
-            cv_rect(8 + (int32_t)w * 14 - 5, 0, 9, 34, lit >> k & 1u ? C_ACC : C_BLACK);
-        else
-            w++;
-    cv_blit(0, 140);
-}
-
-/* ---- the settings: one byte each, kept in flash; the F_ order is the struct's */
+/* ---- the settings: one byte each, kept in flash; the F_ order is the struct's.
+ * Each engine has its own timbre and cycle; DRONE, STABS and BLOOM each their own attack and release. The engine is
+ * not kept: every power-on starts in UMWELT. */
 #define NCHG 11u
 static const uint8_t CHG_N[NCHG] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16};   /* CHORDS: pulses a chord; 0: HOLD */
 #define NATT 14u
 #define NREL 14u
-static struct { uint8_t oct, ch, tim, den, key, pul, shp, sea, cut, res, spc, mix, eng, spr, pit, chg, att[2], rel[2], his, ton, crk, wob; } set;
-enum { F_OCT, F_CH, F_TIM, F_DEN, F_KEY, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_ENG, F_SPR, F_PIT, F_CHG,
-       F_ATT, F_ATT1, F_REL, F_REL1, F_HIS, F_TON, F_CRK, F_WOB, F_N, F_CPU = F_N };
+static struct {
+    uint8_t oct, ch, den, pul, shp, sea, cut, res, spc, mix, spr, pit, chg, his, ton, crk, wob, bpm, spl, tnc, scl, umd, chc;
+    uint8_t tim[2], att[3], rel[3], stp[2], hit[2], rot[2], rat[2];
+} set;
+enum { F_OCT, F_CH, F_DEN, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_SPR, F_PIT, F_CHG, F_HIS, F_TON, F_CRK, F_WOB,
+       F_BPM, F_SPL, F_TNC, F_SCL, F_UMD, F_CHC, F_TIM, F_TIM1, F_ATT, F_ATT1, F_ATT2, F_REL, F_REL1, F_REL2,
+       F_STP, F_STP1, F_HIT, F_HIT1, F_ROT, F_ROT1, F_RAT, F_RAT1, F_N, F_CPU = F_N };
 #define CFG ((uint8_t *)&set)
-static const uint8_t CFG_MIN[F_N] = {0, 0, 0, 1};   /* (the rest: 0) */
-static const uint8_t CFG_MAX[F_N] = {255, 16, NT - 1u, DV, 11, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u,
-    NSPACE - 1u, NMIX - 1u, 1, 8, 24, NCHG - 1u, NATT - 1u, NATT - 1u, NREL - 1u, NREL - 1u, 20, 10, 20, 10};
-static const uint8_t CFG_DEF[F_N] = {0, 0, 0, 4, 0, 4, 1, 0, NCUT - 1u, 0, 8, 5, 0, 8, 12, 5,
-    10, 4, 10, 8, 0, 5, 0, 0};                  /* DRONE: attack 3 s, release 6 s; BLOOM: 350 ms, 3 s */
-static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "TIMBRE", "DENSITY", "KEY", "PULSE", "SHAPE", "SEASON", "FILTER", "RES",
-    "SPACE", "MIX", "ENGINE", "SPREAD", "PITCH", "CHORDS", "ATTACK", "ATTACK", "RELEASE", "RELEASE", "HISS", "TONE", "CRACKLE",
-    "WOBBLE", "CPU"};
-/* the pages: HOME, SEL (the engine), LFO, FX 1, FX 2; F_ATT / F_REL mean the engine's own */
-enum { P_HOME, P_SEL, P_LFO, P_FX1, P_FX2, NPAGE };
-static const uint8_t PAGE_F[NPAGE][4] = {{F_DEN, F_SPR, F_PIT, F_CHG}, {F_ENG, F_TIM, F_ATT, F_REL}, {F_PUL, F_SHP, F_SEA, F_CPU},
-                                         {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}};
+static const uint8_t CFG_MIN[F_N] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0};
+static const uint8_t CFG_MAX[F_N] = {255, 16, DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u,
+    NMIX - 1u, 8, 24, NCHG - 1u, 20, 10, 20, 10, 200, NSPELL - 1u, 11, 11, 1, 20, NT - 1u, NT - 1u, NATT - 1u, NATT - 1u,
+    NATT - 1u, NREL - 1u, NREL - 1u, NREL - 1u, 32, 32, 32, 32, 31, 31, NRATE - 1u, NRATE - 1u};
+static const uint8_t CFG_DEF[F_N] = {0, 0, 4, 8, 1, 0, NCUT - 1u, 0, 8, 5, 8, 12, 5, 0, 5, 0, 0, 90, 0, 0, 0, 0, 20,
+    0, 4,                                       /* timbre: UMWELT MOSS, BLOOM REED */
+    10, 1, 4,  10, 4, 8,                        /* attack, release: DRONE 3 s, 6 s; STABS 50 ms, 750 ms; BLOOM 350 ms, 3 s */
+    7, 9, 3, 4, 0, 0, 1, 1};                    /* cycles: UMWELT 3 in 7, BLOOM 4 in 9, in eighths */
+static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "DENSITY", "PULSE", "SHAPE", "SEASON", "FILTER", "RES", "SPACE", "MIX",
+    "SPREAD", "PITCH", "CHORDS", "HISS", "TONE", "CRACKLE", "WOBBLE", "TEMPO", "SPELL", "TONIC", "SCALE", "MODE", "CHANCE",
+    "TIMBRE", "TIMBRE", "ATTACK", "ATTACK", "ATTACK", "RELEASE", "RELEASE", "RELEASE", "STEPS", "STEPS", "HITS", "HITS",
+    "ROTATE", "ROTATE", "RATE", "RATE", "CPU"};
+/* the pages: HOME; EDIT 1, 2 (the engine's own: SEL picks the engine); LFO; FX 1, 2; the BOOK (GLO) */
+enum { P_HOME, P_ED1, P_ED2, P_LFO, P_FX1, P_FX2, P_BOOK, NPAGE };
+static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, STABS or BLOOM */
 static uint32_t page_field(uint32_t page, uint32_t k)
 {
-    uint32_t f = PAGE_F[page][k];
-    return f == F_ATT || f == F_REL ? f + set.eng : f;
+    static const uint8_t PF[NPAGE][4] = {{F_DEN, F_SPR, F_PIT, F_CHG}, {F_UMD, F_TIM, F_ATT, F_REL}, {F_STP, F_HIT, F_ROT, F_RAT},
+        {F_BPM, F_PUL, F_SHP, F_SEA}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}, {F_SPL, F_TNC, F_SCL, F_CPU}};
+    static const uint8_t BLOOM_ED1[4] = {F_TIM, F_ATT, F_REL, F_CHC};
+    uint32_t f = page == P_ED1 && eng_sel ? BLOOM_ED1[k] : PF[page][k];
+    if (f == F_ATT || f == F_REL) return f + env_ix();
+    if (f == F_TIM || f == F_STP || f == F_HIT || f == F_ROT || f == F_RAT) return f + eng_sel;
+    return f;
+}
+static uint32_t cfg_max(uint32_t f)             /* the top of a setting, some of them by another */
+{
+    if (f == F_SCL) return SPELL[set.spl].n - 1u;
+    if (f == F_HIT || f == F_HIT1) return CFG[f - F_HIT + F_STP];
+    if (f == F_ROT || f == F_ROT1) return CFG[f - F_ROT + F_STP] - 1u;
+    return CFG_MAX[f];
 }
 static void apply(void)                         /* the settings to the sound */
 {
     fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
-    tim_now = set.tim;
-    engine = set.eng;
-    env_att = ATT_INC[set.att[set.eng]];
-    env_rel = REL_K[set.rel[set.eng]];
+    tim_now = set.tim[eng_sel];
+    um_mode = set.umd;
+    engine = eng_sel || set.umd;                /* the audio: 0 hold (DRONE), 1 triggered (STABS, BLOOM) */
+    trig_boost = eng_sel;
+    env_att = ATT_INC[set.att[env_ix()]];
+    env_rel = REL_K[set.rel[env_ix()]];
     spread = set.spr;
     pitch = (int32_t)set.pit - 12;
     chord_every = CHG_N[set.chg];
@@ -705,20 +791,145 @@ static void apply(void)                         /* the settings to the sound */
     wob_depth = WOB_D[set.wob];
 }
 
+/* ---- the screen: the title; the spell's sigil on the left; the scale, the chord and the network on the right; the
+ * spell, engine and timbre; the page's four knobs; the pages as tabs */
+#define C_ACC RGB(120, 170, 90)                 /* moss green */
+#define C_KEY RGB(210, 210, 210)
+#define C_OFF RGB(90, 90, 90)
+#define C_FAINT RGB(50, 62, 46)
+#define C_GLOW RGB(190, 235, 150)
+#define KEY0 53u                                /* key 0 = F3 */
 static const char *const TIM_NAME[NT] = {"MOSS", "MIST", "CHOIR", "ORGAN", "REED"};
-static const char *const ENG_NAME[2] = {"DRONE", "BLOOM"};
 static void put(char **p, const char *a) { while (*a) *(*p)++ = *a++; }
 static void put_num(char **p, uint32_t n) { if (n >= 100u) *(*p)++ = (char)('0' + n / 100u); if (n >= 10u) *(*p)++ = (char)('0' + n / 10u % 10u); *(*p)++ = (char)('0' + n % 10u); }
 static void put_signed(char **p, int32_t n) { if (n) *(*p)++ = n < 0 ? '-' : '+'; put_num(p, (uint32_t)(n < 0 ? -n : n)); }
 
-static void draw_info(uint32_t key, int32_t oct, int lit)   /* "KEY C   DRONE   MOSS" (+ OCT, CH when set) */
+/* sigils: each spell's scales are points on its own figure; the scale now is lit (and glows a moment after a turn) */
+static int32_t sx(uint32_t a, int32_t r) { return (sine(a + 0x40000000u) * r) >> 15; }   /* r cos a (a: a full turn is 2^32) */
+static int32_t sy(uint32_t a, int32_t r) { return (sine(a) * r) >> 15; }                 /* r sin a */
+static void cv_ring(int32_t cx, int32_t cy, int32_t r, uint16_t c, uint32_t dots)   /* a circle; dots: every other segment */
 {
-    char s[40], *p = s;
-    put(&p, "KEY "); put(&p, KEY_NAME[key]); put(&p, "   "); put(&p, ENG_NAME[set.eng]); put(&p, "   "); put(&p, TIM_NAME[set.tim]);
-    if (oct) { put(&p, "  OCT"); *p++ = oct < 0 ? '-' : '+'; *p++ = (char)('0' + (oct < 0 ? -oct : oct)); }
-    if (set.ch) { put(&p, "  CH"); put_num(&p, set.ch); }
+    uint32_t i;
+    for (i = 0; i < 48u; i++) {
+        uint32_t a = i * (4294967295u / 48u), b = a + 4294967295u / 48u;
+        if (!dots || !(i & 1u)) cv_line(cx + sx(a, r), cy + sy(a, r), cx + sx(b, r), cy + sy(b, r), c);
+    }
+}
+static void draw_sigil(uint32_t sp, uint32_t cur, int glow)
+{
+    const uint32_t n = SPELL[sp].n, Q = 0x40000000u, W = 100, H = 96;
+    int32_t px[12], py[12], cx = 50, cy = 48;
+    uint32_t i;
+    uint16_t hi = glow ? C_GLOW : C_ACC;
+    cv_begin(W, H, C_BLACK);
+    switch (sp) {
+    case 0:                                     /* WHEEL: a wheel of twelve, the hand on the key now */
+        cv_ring(cx, cy, 40, C_FAINT, 0);
+        cv_ring(cx, cy, 4, C_FAINT, 0);
+        for (i = 0; i < n; i++) {
+            uint32_t a = i * (4294967295u / 12u) - Q;
+            px[i] = cx + sx(a, 40); py[i] = cy + sy(a, 40);
+            cv_line(cx + sx(a, 34), cy + sy(a, 34), px[i], py[i], C_FAINT);
+        }
+        cv_line(cx, cy, cx + sx(cur * (4294967295u / 12u) - Q, 33), cy + sy(cur * (4294967295u / 12u) - Q, 33), hi);
+        break;
+    case 1:                                     /* STILLWATER: still lines of water, the scales along the middle one */
+        for (i = 0; i < 3u; i++) {
+            uint32_t x;
+            for (x = 6; x < 94u; x++)
+                cv_pset((int32_t)x, 28 + (int32_t)i * 20 + (sine(x * 0x05000000u + i * Q) * 3 >> 15), i == 1u ? C_ACC : C_FAINT);
+        }
+        for (i = 0; i < n; i++) { px[i] = 14 + (int32_t)i * 14; py[i] = 48 + (sine((uint32_t)px[i] * 0x05000000u + Q) * 3 >> 15); }
+        break;
+    case 2:                                     /* HOLLOW: a bowl under a dark moon */
+        cv_ring(cx, 30, 12, C_FAINT, 0);
+        cv_ring(cx + 5, 27, 10, C_FAINT, 1);
+        for (i = 0; i < n; i++) {
+            uint32_t a = 0x0E38E38Eu + i * (0x638E38E3u / (n - 1u));   /* 20 .. 160 degrees: the lower half, a bowl */
+            px[i] = cx + sx(a, 40); py[i] = 44 + sy(a, 40);
+            if (i) cv_line(px[i - 1u], py[i - 1u], px[i], py[i], C_FAINT);
+        }
+        break;
+    case 3:                                     /* MEADOW: a sun, its rays the scales */
+        cv_ring(cx, cy, 10, C_ACC, 0);
+        for (i = 0; i < 8u; i++) {
+            uint32_t a = i * (Q / 2u) + Q / 4u;
+            cv_line(cx + sx(a, 15), cy + sy(a, 15), cx + sx(a, i & 1u ? 24 : 32), cy + sy(a, i & 1u ? 24 : 32), C_FAINT);
+        }
+        for (i = 0; i < n; i++) { uint32_t a = i * Q + Q / 2u; px[i] = cx + sx(a, 38); py[i] = cy + sy(a, 38); }
+        break;
+    case 4:                                     /* FAE RING: a ring of mushrooms */
+        cv_ring(cx, cy + 4, 34, C_FAINT, 1);
+        for (i = 0; i < n; i++) {
+            uint32_t a = i * (4294967295u / 6u) - Q;
+            px[i] = cx + sx(a, 34); py[i] = cy + 4 + sy(a, 34);
+            cv_rect(px[i], py[i] + 3, 1, 5, C_FAINT);   /* the stem; the cap is the point */
+        }
+        break;
+    default:                                    /* OLD SONG: a cairn of stones */
+        for (i = 0; i < n; i++) {
+            int32_t w = 64 - (int32_t)i * 12, y = 80 - (int32_t)i * 16;
+            cv_rect(cx - w / 2, y - 5, w, 11, i == cur ? hi : C_FAINT);
+            px[i] = cx; py[i] = y;
+        }
+        cv_blit(4, 24);
+        return;
+    }
+    for (i = 0; i < n; i++) {                   /* the scales: dim seeds, the one now lit */
+        if (i == cur) cv_rect(px[i] - 4, py[i] - 4, 9, 9, hi);
+        else cv_rect(px[i] - 2, py[i] - 2, 5, 5, sp == 4u ? C_ACC : C_OFF);
+    }
+    cv_blit(4, 24);
+}
+static void draw_scale(int lit)                 /* "D DORIAN" over the chord (green a moment after the season turns) */
+{
+    char s[24], *p = s;
+    put(&p, PC_NAME[scale_pc[0]]); *p++ = ' '; put(&p, MODE_NAME[SPELL[spell_now].mode[scale_now]]);
     *p = 0;
-    draw_text_box(0, 52, 240, &FONT_S, s, lit ? C_ACC : C_OFF, 1);   /* (green a moment when the season moves the key) */
+    cv_begin(132, 16, C_BLACK);
+    cv_text((132 - text_w(&FONT_S, s)) / 2, 0, &FONT_S, s, lit ? C_ACC : C_OFF);
+    cv_blit(108, 28);
+}
+static void draw_note(void)                     /* the chord: its root big, the accidental and the quality small */
+{
+    cv_begin(132, 32, C_BLACK);
+    if (drone_on) {
+        const char *nm = PC_NAME[cpc(chord_now, 0)], *q = chord_qual(chord_now);
+        char root[2] = {nm[0], 0};
+        int32_t x = (132 - (text_w(&FONT_L, root) + text_w(&FONT_S, nm + 1) + 2 + text_w(&FONT_S, q))) / 2;
+        x = cv_text(x, 0, &FONT_L, root, C_ACC);
+        x = cv_text(x, 1, &FONT_S, nm + 1, C_ACC) + 2;   /* b or #, raised */
+        cv_text(x, 15, &FONT_S, q, C_ACC);
+    } else
+        cv_text((132 - text_w(&FONT_S, "press PLAY")) / 2, 9, &FONT_S, "press PLAY", C_OFF);
+    cv_blit(108, 48);
+}
+static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding)   /* nodes and threads: grown ones lit; bit i: node i sounds */
+{
+    static const int8_t DY[DV] = {2, -5, 4, -3, 5, -4};   /* a little unevenness, like something that grew */
+    uint32_t i;
+    uint16_t lit = flash ? C_GLOW : on ? C_ACC : RGB(70, 90, 60), seed = RGB(55, 55, 55);   /* a pulse: brighter a moment */
+    cv_begin(132, 26, C_BLACK);
+    for (i = 0; i + 1u < DV; i++) {
+        int32_t x0 = 16 + (int32_t)i * 20, x1 = x0 + 20, y0 = 13 + DY[i], y1 = 13 + DY[i + 1u];
+        uint16_t c = i + 1u < den ? lit : seed;
+        cv_line(x0, y0, x1, y1, c);
+        if (i + 1u < den) cv_line(x0, y0 + 1, x1, y1 + 1, c);
+    }
+    for (i = 0; i < DV; i++) {
+        int32_t x = 16 + (int32_t)i * 20, y = 13 + DY[i];
+        if (i < den) cv_rect(x - 4, y - 4, 9, 9, sounding >> i & 1u ? C_GLOW : lit);
+        else cv_rect(x - 2, y - 2, 5, 5, seed);
+    }
+    cv_blit(108, 88);
+}
+static void draw_info(void)                     /* "WHEEL   UMWELT DRONE   MOSS" */
+{
+    char s[44], *p = s;
+    put(&p, SPELL[spell_now].name); put(&p, "   ");
+    put(&p, eng_sel ? "BLOOM" : set.umd ? "UM STABS" : "UM DRONE"); put(&p, "   "); put(&p, TIM_NAME[set.tim[eng_sel]]);
+    *p = 0;
+    draw_text_box(0, 128, 240, &FONT_S, s, C_OFF, 1);
 }
 static void fmt_season(char **p, uint32_t sea)   /* OFF, 45s, 1m, 1m15 */
 {
@@ -734,92 +945,63 @@ static void fmt_field(char **q, uint32_t f, uint32_t cpu)   /* a setting's value
     switch (f) {
     case F_PIT: if (v == 12u) put(q, "0"); else put_signed(q, (int32_t)v - 12); break;
     case F_CHG: if (CHG_N[v]) put_num(q, CHG_N[v]); else put(q, "HOLD"); break;
-    case F_ENG: put(q, ENG_NAME[v]); break;
-    case F_TIM: put(q, TIM_NAME[v]); break;
-    case F_ATT: case F_ATT1: put(q, ATT_LABEL[v]); break;
-    case F_REL: case F_REL1: put(q, REL_LABEL[v]); break;
-    case F_PUL: if (PULSE_S[v]) { put_num(q, PULSE_S[v]); *(*q)++ = 's'; } else put(q, "STILL"); break;
+    case F_UMD: put(q, v ? "STABS" : "DRONE"); break;
+    case F_TIM: case F_TIM1: put(q, TIM_NAME[v]); break;
+    case F_ATT: case F_ATT1: case F_ATT2: put(q, ATT_LABEL[v]); break;
+    case F_REL: case F_REL1: case F_REL2: put(q, REL_LABEL[v]); break;
+    case F_PUL: put(q, PULSE_LABEL[v]); break;
     case F_SHP: put(q, SHAPE_NAME[v]); break;
     case F_SEA: fmt_season(q, v); break;
     case F_CUT: put(q, CUT_LABEL[v]); break;
     case F_SPC: put(q, SPACE_LABEL[v]); break;
-    case F_MIX: put_num(q, v * 5u); *(*q)++ = '%'; break;
+    case F_MIX: case F_CHC: put_num(q, v * 5u); *(*q)++ = '%'; break;
     case F_TON: if (v == 5u) put(q, "WHITE"); else put_signed(q, (int32_t)v - 5); break;
     case F_HIS: case F_CRK: case F_WOB: if (v) put_num(q, v); else put(q, "OFF"); break;
+    case F_SPL: put(q, SPELL_SHORT[v]); break;
+    case F_TNC: put(q, TONIC_NAME[v]); break;
+    case F_SCL: put_num(q, v + 1u); *(*q)++ = '/'; put_num(q, SPELL[set.spl].n); break;
+    case F_HIT: case F_HIT1: put_num(q, v < CFG[f - F_HIT + F_STP] ? v : CFG[f - F_HIT + F_STP]); break;
+    case F_RAT: case F_RAT1: put(q, RATE_LABEL[v]); break;
     case F_CPU: if (cpu) { put_num(q, cpu); *(*q)++ = '%'; } else put(q, "--"); break;
     default: put_num(q, v); break;
     }
 }
-static uint32_t cfg_min(uint32_t f) { return f < 4u ? CFG_MIN[f] : 0u; }
-/* the four knobs of the page: a name, its value, a bar */
-static void draw_knobs(uint32_t page, uint32_t cpu)
+static void draw_knobs(uint32_t page, uint32_t cpu)   /* the page's four knobs: a name, its value, a bar */
 {
     uint32_t k;
     cv_begin(240, 50, C_BLACK);
     for (k = 0; k < 4u; k++) {
         uint32_t f = page_field(page, k), x0 = k * 60u;
-        char v[12], *q = v;
+        char v[16], *q = v;
         fmt_field(&q, f, cpu);
         *q = 0;
         cv_text((int32_t)x0 + (60 - text_w(&FONT_S, F_NAME[f])) / 2, 0, &FONT_S, F_NAME[f], C_OFF);
         cv_text((int32_t)x0 + (60 - text_w(&FONT_S, v)) / 2, 18, &FONT_S, v, f == F_CPU ? C_OFF : C_ACC);
-        if (f < F_N) {
-            uint32_t w = (CFG[f] - cfg_min(f)) * 46u / (CFG_MAX[f] - cfg_min(f));
+        if (f < F_N && cfg_max(f) > CFG_MIN[f]) {
+            uint32_t val = CFG[f] > cfg_max(f) ? cfg_max(f) : CFG[f];
+            uint32_t w = (val - CFG_MIN[f]) * 46u / (cfg_max(f) - CFG_MIN[f]);
             cv_rect((int32_t)x0 + 7, 40, 46, 3, RGB(45, 45, 45));
             if (w) cv_rect((int32_t)x0 + 7, 40, (int32_t)w, 3, C_ACC);
         }
     }
-    cv_blit(0, 148);
+    cv_blit(0, 150);
 }
 static void draw_tabs(uint32_t page)            /* the bottom line: the pages, the one shown lit */
 {
-    static const char *const TAB[NPAGE] = {"HOME", "SEL", "LFO", "FX1", "FX2"};
+    static const char *const TAB[5] = {"HOME", "EDIT", "LFO", "FX", "BOOK"};
+    static const uint8_t TAB_OF[NPAGE] = {0, 1, 1, 2, 3, 3, 4};
     uint32_t i;
     int32_t x, w = 0;
-    for (i = 0; i < NPAGE; i++) w += text_w(&FONT_S, TAB[i]) + (i ? 14 : 0);
+    for (i = 0; i < 5u; i++) w += text_w(&FONT_S, TAB[i]) + (i ? 14 : 0) + ((i == 1u || i == 3u) ? text_w(&FONT_S, "2") : 0);
     x = (240 - w) / 2;
     cv_begin(240, 16, C_BLACK);
-    for (i = 0; i < NPAGE; i++) x = cv_text(x, 0, &FONT_S, TAB[i], i == page ? C_ACC : RGB(65, 65, 65)) + 14;
+    for (i = 0; i < 5u; i++) {
+        uint16_t c = i == TAB_OF[page] ? C_ACC : RGB(65, 65, 65);
+        x = cv_text(x, 0, &FONT_S, TAB[i], c);
+        if (i == 1u || i == 3u) x = cv_text(x, 0, &FONT_S, (page == P_ED2 || page == P_FX2) && i == TAB_OF[page] ? "2" : " ", c);
+        x += 14;
+    }
     cv_blit(0, 214);
-}
-
-static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding)   /* nodes and threads: grown ones lit, the rest seeds; bit i: node i sounds */
-{
-    static const int8_t DY[DV] = {2, -5, 4, -3, 5, -4};   /* a little unevenness, like something that grew */
-    uint32_t i;
-    uint16_t lit = flash ? RGB(190, 235, 150) : on ? C_ACC : RGB(70, 90, 60), seed = RGB(55, 55, 55);   /* a pulse: brighter a moment */
-    cv_begin(240, 26, C_BLACK);
-    for (i = 0; i + 1u < DV; i++) {             /* the threads between grown nodes */
-        int32_t x0 = 45 + (int32_t)i * 30, x1 = x0 + 30, y0 = 13 + DY[i], y1 = 13 + DY[i + 1u];
-        uint16_t c = i + 1u < den ? lit : seed;
-        cv_line(x0, y0, x1, y1, c);
-        if (i + 1u < den) cv_line(x0, y0 + 1, x1, y1 + 1, c);
-    }
-    for (i = 0; i < DV; i++) {                  /* the nodes */
-        int32_t x = 45 + (int32_t)i * 30, y = 13 + DY[i];
-        if (i < den) cv_rect(x - 4, y - 4, 9, 9, sounding >> i & 1u ? RGB(190, 235, 150) : lit);
-        else cv_rect(x - 2, y - 2, 5, 5, seed);
-    }
-    cv_blit(0, 113);
-}
-
-static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)   /* where notes came from last, the clock */
-{
-    char s[32] = "", *p = s;
-    const char *a = src == 2u ? "TRS IN" : src == 1u ? "USB IN" : "";
-    while (*a) *p++ = *a++;
-    if (bpm) {
-        if (p != s) { *p++ = ' '; *p++ = ' '; }
-        a = running ? "CLOCK " : "clock ";
-        while (*a) *p++ = *a++;
-        if (bpm >= 100u) *p++ = (char)('0' + bpm / 100u);
-        *p++ = (char)('0' + bpm / 10u % 10u);
-        *p++ = (char)('0' + bpm % 10u);
-        a = " BPM";
-        while (*a) *p++ = *a++;
-    }
-    *p = 0;
-    draw_text_box(0, 120, 240, &FONT_S, s, C_OFF, 1);
 }
 
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
@@ -858,8 +1040,8 @@ static void app_idle(void)
 
 static void app_main(void)
 {
-    uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, status_drawn = ~0u;
-    uint32_t midi_drawn = ~0u, lfo_drawn = ~0u, hint_drawn = ~0u, key_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0;
+    uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, scale_drawn = ~0u, info_drawn = ~0u, sigil_drawn = ~0u;
+    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, tabs_drawn = ~0u, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0;
 #ifndef DINGHY_HOST
     uint32_t cpu_t = 0;
 #endif
@@ -872,18 +1054,21 @@ static void app_main(void)
 #endif
     {                                           /* the settings: loaded, every one in its range, else all the defaults */
         int ok = !settings_load(&set, sizeof set) && (int8_t)set.oct >= -2 && (int8_t)set.oct <= 2;
-        for (k = 1; ok && k < F_N; k++) ok = CFG[k] >= cfg_min(k) && CFG[k] <= CFG_MAX[k];
+        for (k = 1; ok && k < F_N; k++) ok = CFG[k] >= CFG_MIN[k] && CFG[k] <= CFG_MAX[k];
+        if (ok) ok = set.scl < SPELL[set.spl].n;
         if (!ok) for (k = 0; k < F_N; k++) CFG[k] = CFG_DEF[k];
     }
+    eng_sel = 0;                                /* every power-on: UMWELT */
+    spell_now = set.spl; tonic = set.tnc; scale_now = set.scl;
+    scale_load();
     apply();
-    tim_prev = set.tim;
+    tim_prev = tim_now;
     density = set.den;
-    key_now = set.key;
     lcd_fill(0, 0, 240, 240, C_BLACK);
-    draw_text_box(0, 18, 240, &FONT_L, APP_NAME, C_ACC, 1);
+    draw_text_box(0, 4, 240, &FONT_S, APP_NAME, C_ACC, 1);
 
     for (;;) {
-        uint32_t keys, down, up, rel, b, lit = 0, out_ch = set.ch ? set.ch - 1u : 0u, st;
+        uint32_t keys, down, up, rel, b, lit = 0, out_ch = set.ch ? set.ch - 1u : 0u, st, e8 = eng_sel;
         int32_t oct = (int8_t)set.oct, e;
         uint32_t base = (uint32_t)((int32_t)KEY0 + 12 * oct);
         platform_poll();
@@ -923,50 +1108,57 @@ static void app_main(void)
         b = fm1_input_edges(&rel);              /* buttons pressed since the last call (bit = button id) */
         if (b & (1u << BTN_OCT_DOWN) && oct > -2) { set.oct = (uint8_t)(oct - 1); dirty = 1; t_change = fm1_ms; }
         if (b & (1u << BTN_OCT_UP) && oct < 2) { set.oct = (uint8_t)(oct + 1); dirty = 1; t_change = fm1_ms; }
-        if ((e = fm1_enc_take(ENC_SELECT)) != 0) {     /* SELECT: the key, round the circle of fifths (pivoting, as the season) */
-            int32_t i = e > 11 ? 11 : e < -11 ? -11 : e;
-            for (; i > 0; i--) key_step(1);
-            for (; i < 0; i++) key_step(-1);
-            set.key = (uint8_t)key_now;
+        if (b & (1u << BTN_SEL)) { eng_sel ^= 1u; apply(); }               /* SEL: UMWELT <-> BLOOM */
+        if (b & (1u << BTN_HOME)) page = P_HOME;                          /* HOME: back home */
+        if (b & (1u << BTN_EDIT)) page = page == P_ED1 ? P_ED2 : P_ED1;   /* EDIT: the engine's pages */
+        if (b & (1u << BTN_LFO)) page = page == P_LFO ? P_HOME : P_LFO;   /* LFO: tempo, pulse, season (again: home) */
+        if (b & (1u << BTN_FX)) page = page == P_FX1 ? P_FX2 : P_FX1;     /* FX: round the effect pages */
+        if (b & (1u << BTN_GLO)) page = page == P_BOOK ? P_HOME : P_BOOK; /* GLO: the BOOK of spells (again: home) */
+        if ((e = fm1_enc_take(ENC_SELECT)) != 0) {     /* SELECT: the spell's next or last scale (pivoting, as the season) */
+            uint32_t n = SPELL[spell_now].n;
+            cast(spell_now, tonic, (scale_now + (uint32_t)((e % (int32_t)n) + (int32_t)n)) % n);
+            set.scl = (uint8_t)scale_now;
             dirty = 1; t_change = fm1_ms;
         }
-        if (b & (1u << BTN_HOME)) page = P_HOME;                    /* HOME: back home */
-        if (b & (1u << BTN_SEL)) page = page == P_SEL ? P_HOME : P_SEL;   /* SEL: the engine page (again: home) */
-        if (b & (1u << BTN_LFO)) page = page == P_LFO ? P_HOME : P_LFO;   /* LFO: the LFO page (again: home) */
-        if (b & (1u << BTN_FX)) page = page == P_FX1 ? P_FX2 : P_FX1;     /* FX: round the effect pages */
         for (k = 0; k < 4u; k++)                /* KNOB 1..4: the page's four settings */
             if ((e = fm1_enc_take(ENC_KNOB1 + k)) != 0) {
                 uint32_t f = page_field(page, k);
                 int32_t d;
                 if (f >= F_N) continue;         /* (a display, not a setting) */
                 d = (int32_t)CFG[f] + e;
-                CFG[f] = (uint8_t)(d < (int32_t)cfg_min(f) ? (int32_t)cfg_min(f) : d > (int32_t)CFG_MAX[f] ? (int32_t)CFG_MAX[f] : d);
+                CFG[f] = (uint8_t)(d < (int32_t)CFG_MIN[f] ? (int32_t)CFG_MIN[f] : d > (int32_t)cfg_max(f) ? (int32_t)cfg_max(f) : d);
+                if (f == F_STP || f == F_STP1) {   /* fewer steps: hits and rotation stay inside */
+                    uint32_t i = f - F_STP;
+                    if (set.hit[i] > set.stp[i]) set.hit[i] = set.stp[i];
+                    if (set.rot[i] >= set.stp[i]) set.rot[i] = (uint8_t)(set.stp[i] - 1u);
+                }
+                if (f == F_SPL) set.scl = 0;    /* a new spell: from its first scale */
+                if (f == F_SPL || f == F_TNC || f == F_SCL) { cast(set.spl, set.tnc, set.scl); turn_ms = fm1_ms; }
                 apply();
                 if (f == F_DEN) set_density(set.den);
                 if (f == F_SPR || f == F_PIT) revoice();
                 dirty = 1; t_change = fm1_ms;
             }
-        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the timbre, round the ring (as SEL's KNOB 2) */
-            set.tim = (uint8_t)(((int32_t)set.tim + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
+        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the engine's timbre, round the ring */
+            set.tim[eng_sel] = (uint8_t)(((int32_t)set.tim[eng_sel] + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
             apply();
-            dirty = 1;
-            t_change = fm1_ms;
+            dirty = 1; t_change = fm1_ms;
         }
-        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {   /* detents turned since the last call */
+        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {   /* PRESETS: the MIDI channel */
             int32_t c = (int32_t)set.ch + e;
             set.ch = (uint8_t)(c < 0 ? 0 : c > 16 ? 16 : c);
-            dirty = 1;
-            t_change = fm1_ms;
+            dirty = 1; t_change = fm1_ms;
         }
 
         if (b & (1u << BTN_PLAY)) {             /* PLAY: grow, or let it fade back into the ground */
             if (drone_on) grow_stop();
             else grow_start();
         }
-        if (lfo_tick(set.pul, set.shp, set.sea)) {   /* the season moved the key */
-            set.key = (uint8_t)key_now;
-            dirty = 1; t_change = fm1_ms; key_ms = fm1_ms;
+        if (lfo_tick(set.bpm, set.pul, set.shp, set.sea)) {   /* the season turned */
+            set.scl = (uint8_t)scale_now;
+            dirty = 1; t_change = fm1_ms; turn_ms = fm1_ms;
         }
+        cycle_tick(set.bpm, set.rat[eng_sel], set.stp[eng_sel], set.hit[eng_sel], set.rot[eng_sel], set.chc);
 
         midi_in();
         if (clk_bpm && fm1_ms - clk_t0 > 2000u) clk_bpm = 0, clk_run = 0;   /* the clock has stopped coming */
@@ -981,28 +1173,24 @@ static void app_main(void)
                 lit |= 1u << (drone[k].note - base);
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
+        fm1_led_key(BTN_SEL, !eng_sel);         /* lit: UMWELT */
         fm1_led_key(BTN_HOME, page == P_HOME);  /* the page's button lit */
-        fm1_led_key(BTN_SEL, page == P_SEL);
+        fm1_led_key(BTN_EDIT, page == P_ED1 || page == P_ED2);
         fm1_led_key(BTN_LFO, page == P_LFO);
         fm1_led_key(BTN_FX, page == P_FX1 || page == P_FX2);
+        fm1_led_key(BTN_GLO, page == P_BOOK);
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
-        fm1_led_key(BTN_PLAY, drone_on || clk_run || (clk_bpm && fm1_ms - clk_beat_ms < 80u));   /* lit: growing */
+        fm1_led_key(BTN_PLAY, drone_on ? !hit_ms || fm1_ms - hit_ms > 60u || (!eng_sel && !set.umd) : clk_run);   /* lit: growing; a blink a hit */
 #if BOARD_SMK37
-        for (k = 0; k < 16u; k++) {             /* a pad glows lilac while its key sounds */
+        for (k = 0; k < 16u; k++) {             /* a pad glows while its key sounds */
             uint32_t w = k < 8u ? k + 8u : k - 8u, on = lit >> WHITE[w] & 1u;
-            padled_set(k, on ? 90 : 4, on ? 60 : 2, on ? 128 : 8);
+            padled_set(k, on ? 60 : 4, on ? 110 : 6, on ? 40 : 2);
         }
         padled_flush();                         /* (sends only what changed) */
 #endif
 
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
-        if ((st = drone_on ? 1000u + chord_now + key_now * 8u : last_note) != note_drawn) { note_drawn = st; draw_note(); }
-        kl = key_ms && fm1_ms - key_ms < 3000u;
-        if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4 | (uint32_t)set.tim << 9 | key_now << 12 | kl << 16 | (uint32_t)set.eng << 17) != status_drawn) { status_drawn = st; draw_info(key_now, oct, kl); }
-        st = page | cpu_pct << 3;               /* the panel: redrawn when the page, a value on it or the CPU changes */
-        for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
-        if (st != lfo_drawn) { lfo_drawn = st; draw_knobs(page, cpu_pct); }
 #ifndef DINGHY_HOST
         if (fm1_ms - cpu_t >= 1000u) {          /* the audio ISR's worst run of the last second, of its 5.8 ms */
             cpu_t = fm1_ms;
@@ -1010,11 +1198,19 @@ static void app_main(void)
             cpu_max_us = 0;
         }
 #endif
-        if (page != hint_drawn) { hint_drawn = page; draw_tabs(page); }
+        kl = turn_ms && fm1_ms - turn_ms < 3000u;   /* the season just turned: the sigil and the scale glow */
+        if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
+        if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
+        if ((st = drone_on ? 1000u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u : 0u) != note_drawn) { note_drawn = st; draw_note(); }
         fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
-        snd = 0;                                /* BLOOM: the nodes of the voices sounding now */
-        if (set.eng) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
-        if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5 | snd << 6) != midi_drawn) { midi_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl, snd); }
+        snd = 0;                                /* STABS, BLOOM: the nodes of the voices sounding now */
+        if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
+        if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5 | snd << 6) != net_drawn) { net_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl, snd); }
+        if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
+        st = page | cpu_pct << 3 | e8 << 12;    /* the panel: redrawn when the page, a value on it or the CPU changes */
+        for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
+        if (st != knobs_drawn) { knobs_drawn = st; draw_knobs(page, cpu_pct); }
+        if (page != tabs_drawn) { tabs_drawn = page; draw_tabs(page); }
         idle_ok = 0;
 
         if (dirty && quiet() && fm1_ms - t_change > 2000u) {   /* 2 s after the change, when silent (an erase stalls the sound) */
