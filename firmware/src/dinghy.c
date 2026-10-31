@@ -43,78 +43,123 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
     return y > 32767 ? 32767 : y < -32767 ? -32767 : y;
 }
 
-/* ---- Groundkeeper's drone: DV voices that hold a chord and drift (the audio part; the decisions are in the main loop)
- * Each voice is two sines a hair apart (slow beating) and a soft octave above, with its own slow "breath".
- * The main loop sets a voice's target pitch; here the pitch glides there over a second or two. */
+/* ---- Groundkeeper's voices (audio ISR; the decisions are in the main loop)
+ * DV voices, each two oscillators a few cents apart (a slow beat) in one of five timbres, with its own slow "breath".
+ * The main loop sets a voice's target pitch; here the pitch glides there over a second or two.
+ * Two engines. DRONE: a voice that is part of the network grows in (ATTACK) and holds; one that is not withers away
+ * (RELEASE). BLOOM: a voice sounds only when the main loop triggers it: it swells to its peak (ATTACK), then fades
+ * (RELEASE), and leaves silence until the next one. */
+#include "gk_tables.h"
 #define DV 6u                                   /* the most voices the network can grow (density 6) */
 static struct {
     volatile uint32_t tinc;                     /* target phase step (main loop writes) */
     uint32_t inc;                               /* the step now: glides to tinc */
-    uint32_t pa, pb, lfo;                       /* the two sines' phases, the breath's phase */
-    volatile uint32_t lfo_inc;                  /* breath speed, per block */
-    volatile int32_t vgate;                     /* 1: this voice is part of the network (main loop writes) */
-    int32_t vamp;                               /* its level now, Q15: grows in / withers out over ~3 s */
-    volatile uint8_t note;
+    uint32_t pa, pb, lfo, vph;                  /* the oscillators' phases, the breath's, the vibrato's */
+    volatile uint32_t lfo_inc, vib_inc;         /* breath and vibrato speeds, per block */
+    volatile int32_t vgate;                     /* DRONE: 1 = part of the network (main loop writes) */
+    volatile uint32_t trig;                     /* BLOOM: +1 = bloom now (main loop writes, after peak and the note) */
+    volatile int32_t peak;                      /* BLOOM: how loud this bloom gets, Q15 */
+    uint32_t tseen;                             /* (the last trig the audio saw) */
+    int32_t vamp, glast, nlp;                   /* its level now (Q15), its gain at the end of the last block, MIST's breath */
+    uint8_t stage;                              /* BLOOM: 1 rising, else falling */
+    volatile uint8_t note, band;                /* the note, and its wavetable band */
 } drone[DV];
-#define NT 4u                                   /* timbres: MOSS, LOAM, MIST, ROOT */
+#define NT 5u                                   /* timbres: MOSS, MIST, CHOIR, ORGAN, REED */
 static volatile uint32_t tim_now;               /* the timbre (main loop writes) */
 static uint32_t tim_prev, tim_xf = 32767;       /* the crossfade from the last one, Q15 (audio) */
+static volatile uint32_t engine;                /* 0 DRONE, 1 BLOOM (main loop writes) */
+static volatile uint32_t env_att = 63, env_rel = 218;   /* the envelope (ATT_INC, REL_K values; main loop writes) */
+static volatile uint32_t wob_depth;             /* WOBBLE: Q16 of the pitch (main loop writes) */
 static volatile int32_t drone_on;               /* 1: growing / sounding, 0: fading to silence */
 static int32_t drone_lvl;                       /* the drone's level now, Q15: fades in and out */
+static uint32_t wob_ph, aud_rng = 0x6C8E9CF5u;
+static int32_t wob_fl;                          /* the wobble's random part (flutter) */
+static int16_t noise[256];                      /* a block of white noise (MIST's breath) */
 #define DRONE_GAIN 4600                         /* per voice, Q15: six voices with partials stay under full scale */
+static const uint8_t DETUNE[NT] = {10, 10, 8, 11, 10};   /* the second oscillator: + inc >> this (10: 1.7 cents) */
+static const uint16_t TGAIN[NT] = {32767, 30000, 40000, 37000, 39000};   /* level per timbre (by RMS, the bright ones a little under) */
+static const uint16_t VIB[NT] = {0, 0, 150, 0, 90};   /* vibrato depth, Q16 of the pitch (CHOIR ~0.23 %, REED ~0.14 %) */
 
-static int32_t shape(uint32_t t, uint32_t pa, uint32_t pb, int32_t breath)   /* one sample of timbre t, ~+-32767 */
+static uint32_t xs32(uint32_t *r) { uint32_t x = *r; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return *r = x; }
+static int32_t wt(const int16_t *t, uint32_t ph)   /* a wavetable, linearly interpolated */
+{
+    uint32_t i = ph >> 23, f = (ph >> 9) & 0x3FFFu;
+    int32_t a = t[i];
+    return a + (((t[i + 1u] - a) * (int32_t)f) >> 14);
+}
+static int32_t shape(uint32_t t, uint32_t pa, uint32_t pb, uint32_t band, int32_t *nlp, int32_t nz)   /* ~+-32767 */
 {
     switch (t) {
-    case 1u:                                    /* LOAM: odd harmonics, hollow and dark, like a soft reed */
-        return (sine(pa) + (sine(pb) >> 1) + ((sine(pa * 3u) * 10923) >> 15) + ((sine(pa * 5u) * 4000) >> 15)) >> 1;
-    case 2u:                                    /* MIST: the pair an octave up, the fundamental underneath, airy */
-        return ((sine(pa << 1) + sine(pb << 1) + (sine(pa) >> 1) + (sine(pa * 3u) >> 3)) * 24576) >> 16;
-    case 3u: {                                  /* ROOT: FM, the modulator a hair off: brighter as the voice breathes in */
-        int32_t m = sine(pb);
-        return (sine(pa + (uint32_t)(m * (breath >> 1))) * 24576) >> 15;   /* up to ~0.8 rad of modulation; 3/4 level */
+    case 1u: {                                  /* MIST: the pair an octave up, the fundamental faint, breath around it */
+        int32_t s = (((sine(pa << 1) + sine(pb << 1)) * 13107) >> 15) + ((sine(pa) * 5461) >> 15) + (sine(pa * 3u) >> 4);
+        *nlp += ((nz - *nlp) * 6000) >> 15;     /* noise below ~1.4 kHz ... */
+        return s + ((*nlp * sine(pa << 1)) >> 14);   /* ... carried up to the octave: a breathy band around the tone */
     }
-    default:                                    /* MOSS: two sines a hair apart and a quiet octave */
-        return (sine(pa) + sine(pb) + (sine(pa << 1) >> 2)) >> 1;
+    case 2u: return (wt(CHOIR_WT[band], pa) + wt(CHOIR_WT[band], pb)) >> 1;   /* CHOIR: an "ah", two singers */
+    case 3u: return (wt(ORGAN_WT, pa) + wt(ORGAN_WT, pb)) >> 1;                /* ORGAN: drawbars */
+    case 4u: return (wt(REED_WT[band], pa) + wt(REED_WT[band], pb)) >> 1;     /* REED: a muted oboe */
+    default: return (sine(pa) + sine(pb) + (sine(pa << 1) >> 2)) >> 1;        /* MOSS: two sines and a quiet octave */
     }
 }
 
-static void drone_audio(int32_t *bus, uint32_t n)   /* adds the drone, mono, to bus */
+static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to bus */
 {
-    uint32_t v, i;
-    int32_t lvl = drone_lvl;
+    uint32_t v, i, eng = engine, att = env_att, rel = env_rel, tn = tim_now, tp;
+    int32_t lvl = drone_lvl, wob;
     if (drone_on) { lvl += 48; if (lvl > 32767) lvl = 32767; }   /* fade in ~4 s */
     else { lvl -= 32; if (lvl < 0) lvl = 0; }                     /* fade out ~6 s */
     drone_lvl = lvl;
-    if (tim_now != tim_prev && tim_xf == 32767) tim_xf = 0;   /* (prev: the old one, now: the new one) */
+    if (tn != tim_prev && tim_xf == 32767) tim_xf = 0;   /* (prev: the old one, now: the new one) */
     if (tim_xf < 32767) {                       /* a new timbre: crossfade over ~0.2 s */
         tim_xf += 1024;
-        if (tim_xf >= 32767) { tim_xf = 32767; tim_prev = tim_now; }
+        if (tim_xf >= 32767) { tim_xf = 32767; tim_prev = tn; }
     }
+    tp = tim_prev;
     if (!lvl) return;                           /* silent: costs nothing */
+    wob_ph += 13710000u;                        /* WOBBLE: a wow at ~0.55 Hz and a slow random flutter */
+    wob_fl += ((int32_t)(xs32(&aud_rng) >> 17) - 16384 - wob_fl) >> 4;
+    wob = (int32_t)(((int64_t)((sine(wob_ph) * 21299 >> 15) + wob_fl) * (int32_t)wob_depth) >> 15);   /* Q16 */
+    if (tn == 1u || tp == 1u)
+        for (i = 0; i < n; i++) noise[i] = (int16_t)(xs32(&aud_rng) >> 16);
     for (v = 0; v < DV; v++) {
-        uint32_t pa = drone[v].pa, pb = drone[v].pb, inc = drone[v].inc, tinc = drone[v].tinc, incb;
-        int32_t breath, g, va = drone[v].vamp;
-        if (drone[v].vgate) { va += 64; if (va > 32767) va = 32767; }   /* grows in over ~3 s */
-        else { va -= 48; if (va < 0) va = 0; }                          /* withers over ~4 s */
+        uint32_t pa = drone[v].pa, pb = drone[v].pb, inc = drone[v].inc, tinc = drone[v].tinc, incm, incb, band = drone[v].band;
+        int32_t breath, g, g0 = drone[v].glast, step, va = drone[v].vamp, va0 = va, mod;
+        if (eng == 0u) {                        /* DRONE: grow in, hold; wither when out of the network */
+            if (drone[v].vgate) { va += (int32_t)att; if (va > 32767) va = 32767; }
+            else va -= ((va * (int32_t)rel) >> 15) + 1;
+        } else {                                /* BLOOM: rise to the peak, then fall */
+            if (drone[v].trig != drone[v].tseen) { drone[v].tseen = drone[v].trig; drone[v].stage = 1; inc = tinc; }
+            if (drone[v].stage == 1u) {
+                va += (int32_t)att;
+                if (va >= drone[v].peak) { va = drone[v].peak; drone[v].stage = 0; }
+            } else va -= ((va * (int32_t)rel) >> 15) + 1;
+        }
+        if (va < 0) va = 0;
         drone[v].vamp = va;
-        if (!va) { drone[v].inc = tinc; continue; }   /* not part of the network: silent, and no glide when it grows */
+        if (!va && !va0) { drone[v].inc = tinc; drone[v].glast = 0; continue; }   /* silent: no glide when it sounds again */
         inc += (uint32_t)((int32_t)(tinc - inc) >> 7);   /* glide: ~1.5 s to settle */
         if ((int32_t)(tinc - inc) > -128 && (int32_t)(tinc - inc) < 128) inc = tinc;
         drone[v].inc = inc;
-        incb = inc + (inc >> 10);               /* +1.7 cents: a slow beat between the two */
+        drone[v].vph += drone[v].vib_inc;       /* the pitch: the glide, the wobble, the timbre's vibrato */
+        mod = wob + ((sine(drone[v].vph) * (int32_t)VIB[tn]) >> 15);
+        incm = inc + (uint32_t)(int32_t)(((int64_t)inc * mod) >> 16);
+        incb = incm + (incm >> DETUNE[tn]);
         drone[v].lfo += drone[v].lfo_inc;
         breath = 24576 + ((sine(drone[v].lfo) * 8192) >> 15);   /* 0.5 .. 1.0 */
-        g = (((((DRONE_GAIN * breath) >> 15) * lvl) >> 15) * va) >> 15;
+        g = (((((((DRONE_GAIN * breath) >> 15) * (int32_t)TGAIN[tn]) >> 15) * lvl) >> 15) * va) >> 15;
+        if (eng) g <<= 1;                       /* BLOOM: a voice or two at a time, so each twice as loud */
+        step = (g - g0) / (int32_t)n;           /* the gain ramps across the block: no steps, even on a fast attack */
         for (i = 0; i < n; i++) {
             int32_t s;
-            pa += inc;
+            pa += incm;
             pb += incb;
-            s = shape(tim_now, pa, pb, breath);
+            s = shape(tn, pa, pb, band, &drone[v].nlp, noise[i]);
             if (tim_xf < 32767)
-                s = (s * (int32_t)(tim_xf >> 1) + shape(tim_prev, pa, pb, breath) * (int32_t)((32767u - tim_xf) >> 1)) >> 14;   /* (signed; no overflow) */
-            bus[i] += (s * g) >> 15;
+                s = (s * (int32_t)(tim_xf >> 1) + shape(tp, pa, pb, band, &drone[v].nlp, noise[i]) * (int32_t)((32767u - tim_xf) >> 1)) >> 14;
+            g0 += step;
+            bus[i] += (s * g0) >> 15;
         }
+        drone[v].glast = g;
         drone[v].pa = pa;
         drone[v].pb = pb;
     }
@@ -160,6 +205,12 @@ static int32_t dm0, dm1, dm2, dm3;              /* the lines' damping states */
 #define RV_DIFF 20480                           /* the allpasses' gain, Q15: 0.625 */
 #define RV_TAIL (44100u * 20u)                  /* frames the reverb runs on after its input goes quiet */
 
+/* TEXTURE (FX 2), after the reverb: HISS, a noise coloured by TONE (a one-pole low-pass below 0, a high-pass above),
+ * L and R apart; CRACKLE, little clicks at random, each panned at random; both follow the drone's fade. */
+static volatile uint32_t tex_hiss, tex_tone = 5, tex_crk;   /* (main loop writes) */
+static uint32_t tex_rng = 0x9E3779B9u;
+static int32_t tx_l, tx_r, ck_l, ck_r;          /* the noise filters' states, the crackle now */
+
 static int32_t sat16(int32_t x) { return x > 32767 ? 32767 : x < -32767 ? -32767 : x; }
 static int32_t glide(int32_t now, int32_t to) { int32_t d = to - now; return d > -8 && d < 8 ? to : now + (d >> 3); }
 static int32_t soft(int32_t x)                  /* above 3/4 of full scale, a quarter as steep */
@@ -182,6 +233,35 @@ static void fx_audio(const int32_t *bus, int32_t *out, uint32_t n, int quiet_in)
     } else rv_rest = 0;
     f = f_now; q = q_now; c = c_now; g = g_now; m = m_now;
     dry = 32767 - (m >> 1);                     /* at MIX 100 % the dry is half */
+    {
+        uint32_t tn = tex_tone, ct = tex_crk;
+        int32_t ta = TONE_A[tn], hg = (int32_t)(((int64_t)tex_hiss * TONE_COMP[tn] >> 15) * drone_lvl >> 15);
+        int32_t cg = drone_lvl;
+        if (hg || ct || ck_l || ck_r) for (i = 0; i < n; i++) {   /* (written to out here; the drone adds below) */
+            uint32_t rr = xs32(&tex_rng);
+            int32_t nl = (int16_t)(rr >> 16), nr = (int16_t)rr, hl, hr;
+            tx_l += ((nl - tx_l) * ta) >> 15;
+            tx_r += ((nr - tx_r) * ta) >> 15;
+            if (tn < 5u) { hl = tx_l; hr = tx_r; }
+            else if (tn > 5u) { hl = nl - tx_l; hr = nr - tx_r; }
+            else { hl = nl; hr = nr; }
+            hl = (int32_t)(((int64_t)hl * hg) >> 15);
+            hr = (int32_t)(((int64_t)hr * hg) >> 15);
+            if (ct && xs32(&tex_rng) < ct) {    /* a crackle: 1500 .. 9500, either sign, panned */
+                uint32_t r2 = xs32(&tex_rng), pan = r2 & 0x7FFFu;
+                int32_t amp = (int32_t)(1500u + (r2 >> 19)) * ((r2 & 0x8000u) ? 1 : -1);
+                amp = (amp * cg) >> 15;
+                ck_l += (amp * (int32_t)(32767u - pan)) >> 15;
+                ck_r += (amp * (int32_t)pan) >> 15;
+            }
+            out[2u * i] += hl + ck_l;
+            out[2u * i + 1u] += hr + ck_r;
+            ck_l = (ck_l * 22938) >> 15;        /* (each click dies in ~0.3 ms; */
+            ck_r = (ck_r * 22938) >> 15;
+            if (ck_l > -8 && ck_l < 8) ck_l = 0;    /*  to zero, not to -1 for ever) */
+            if (ck_r > -8 && ck_r < 8) ck_r = 0;
+        }
+    }
     for (i = 0; i < n; i++) {
         int32_t x = (int32_t)(((int64_t)bus[i] * c) >> 15) << 4, y, l = 0, r = 0;
         for (k = 0; k < 2u; k++) {              /* the filter, twice a sample */
@@ -302,9 +382,12 @@ static const uint8_t CHORD[6][5] = {            /* in C, as pitch classes: root,
 static const char *const QUAL[6] = {"maj7", "m7", "maj7", "m7", "7", "m7"};   /* I vi IV ii V iii */
 static const uint8_t FIFTHS[12] = {0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5};   /* the keys round the circle of fifths: C G D ... F */
 static const char *const KEY_NAME[12] = {"C", "G", "D", "A", "E", "B", "F#", "Db", "Ab", "Eb", "Bb", "F"};
-static const uint8_t RANGE_LO[DV] = {40, 52, 57, 62, 67, 72}, RANGE_HI[DV] = {52, 64, 69, 74, 79, 84};   /* E2..E3 up to C5..C6 */
+static const uint8_t WIN_C[DV] = {46, 58, 63, 68, 73, 78};   /* each voice's window centre at full SPREAD: E2..E3 up to C5..C6 */
 static const uint8_t RANK[DV] = {0, 2, 1, 3, 4, 5};   /* the order voices grow in: the root, the middle, the low, the high, the colours */
 static uint32_t grow_rng = 0x2545F491u, chord_now, key_now, moves_left, grow_ver, density = 4u, pulse_ms;
+static int32_t spread = 8, pitch;               /* SPREAD 0..8 (8: the windows above), PITCH -12..+12 semitones */
+static uint32_t chord_every = 5u;               /* CHORDS: pulses a chord (0: HOLD) */
+static uint32_t bloom_t[DV];                    /* BLOOM: when each voice last bloomed (fm1_ms) */
 
 static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
 {
@@ -314,15 +397,22 @@ static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
 static uint32_t note_inc(uint32_t note) { return INC_C9[note % 12u] >> (10u - note / 12u); }
 static uint32_t cpc(uint32_t c, uint32_t k) { return (CHORD[c][k] + FIFTHS[key_now]) % 12u; }   /* chord c's k-th pitch class, in the key now */
 static int alive(uint32_t v) { return RANK[v] < density; }
+static uint32_t win_lo(uint32_t v)              /* the lowest note of voice v's window (12 semitones wide) */
+{
+    return (uint32_t)(64 + pitch + ((int32_t)WIN_C[v] - 64) * spread / 8 - 6);   /* SPREAD 0: every window at E4..E5 */
+}
+static uint32_t new_moves(void) { return chord_every < 3u ? chord_every : chord_every - 1u + rnd(3u); }   /* (a little give) */
 static int in_chord(uint32_t note, uint32_t c, uint32_t v)   /* a note voice v may hold: voices 4, 5 may hold the colour */
 {
     uint32_t k, nk = v >= 4u ? 5u : 4u;
     for (k = 0; k < nk; k++) if (note % 12u == cpc(c, k)) return 1;
     return 0;
 }
-static int fits(uint32_t v, uint32_t c)         /* voice v's note belongs to chord c (the bass: only the root) */
+static int fits(uint32_t v, uint32_t c)         /* voice v's note belongs to chord c (the bass: only the root), in its window */
 {
-    return v == 0u ? drone[0].note % 12u == cpc(c, 0) : in_chord(drone[v].note, c, v);
+    uint32_t n = drone[v].note;
+    if (n < win_lo(v) || n > win_lo(v) + 12u) return 0;
+    return v == 0u ? n % 12u == cpc(c, 0) : in_chord(n, c, v);
 }
 static int held_by_other(uint32_t pc, uint32_t v)   /* another living upper voice already has this pitch class */
 {
@@ -334,7 +424,7 @@ static uint32_t pick_note(uint32_t v, uint32_t c, int fresh)   /* a chord note i
 {
     uint32_t n, pass, best = drone[v].note, bestd = 0xFFFFu;
     for (pass = 0; pass < 3u && bestd == 0xFFFFu; pass++)   /* 0: every rule; 1: may double a pitch class; 2: may stay */
-        for (n = RANGE_LO[v]; n <= RANGE_HI[v]; n++) {
+        for (n = win_lo(v); n <= win_lo(v) + 12u; n++) {
             uint32_t d = n > drone[v].note ? n - drone[v].note : drone[v].note - n;
             if (v == 0u ? n % 12u != cpc(c, 0) : !in_chord(n, c, v) || (pass == 0u && held_by_other(n % 12u, v))) continue;
             if (fresh && pass < 2u && n == drone[v].note) continue;   /* a drift: somewhere new */
@@ -345,6 +435,7 @@ static uint32_t pick_note(uint32_t v, uint32_t c, int fresh)   /* a chord note i
 }
 static void voice_to(uint32_t v, uint32_t note)
 {
+    drone[v].band = (uint8_t)(note < WT_BAND0 ? 0u : (note - WT_BAND0) / WT_BAND_STEP < WT_NBAND ? (note - WT_BAND0) / WT_BAND_STEP : WT_NBAND - 1u);
     drone[v].note = (uint8_t)note;
     drone[v].tinc = note_inc(note);
     grow_ver++;
@@ -361,6 +452,17 @@ static void set_density(uint32_t d)             /* 1..6: voices grow in (planted
     }
     grow_ver++;
 }
+static void revoice(void)                       /* SPREAD or PITCH moved: every living voice to a chord note in its new window */
+{
+    uint32_t v;
+    for (v = 0; v < DV; v++)
+        if (alive(v)) voice_to(v, pick_note(v, chord_now, 0));
+#ifdef DINGHY_HOST
+    printf("%7u ms  revoice (spread %d, pitch %+d):", (unsigned)fm1_ms, (int)spread, (int)pitch);
+    for (v = 0; v < DV; v++) if (alive(v)) printf(" %u", (unsigned)drone[v].note);
+    printf("\n");
+#endif
+}
 static void key_step(int32_t dir)               /* one step round the circle of fifths (+1 sharpwards), through a pivot */
 {
     uint32_t old[4], c, k, j, best = chord_now, bests = 0;
@@ -376,19 +478,38 @@ static void key_step(int32_t dir)               /* one step round the circle of 
 #ifdef DINGHY_HOST
     printf("%7u ms  season: key %s, pivot chord %u\n", (unsigned)fm1_ms, KEY_NAME[key_now], (unsigned)best);
 #endif
-    moves_left = 4u + rnd(3u);                  /* rest on the pivot a while before the new key's chords move on */
+    moves_left = new_moves();                   /* rest on the pivot a while before the new key's chords move on */
     grow_ver++;
 }
-static void pulse_move(void)                    /* a pulse through the network: one voice moves; now and then the chord */
+static void bloom(void)                         /* BLOOM: one living voice blooms on a note of the chord */
+{
+    uint32_t v, n = 0, pick = DV;
+    for (v = 0; v < DV; v++)                    /* a voice that has nearly faded is free */
+        if (alive(v) && drone[v].vamp < 1500) n++;
+    if (n) {                                    /* a free one, at random */
+        n = rnd(n);
+        for (v = 0; v < DV; v++)
+            if (alive(v) && drone[v].vamp < 1500 && !n--) { pick = v; break; }
+    } else                                      /* none free: the one that bloomed longest ago */
+        for (v = 0; v < DV; v++)
+            if (alive(v) && (pick == DV || (int32_t)(bloom_t[v] - bloom_t[pick]) < 0)) pick = v;
+    if (pick == DV) return;
+    voice_to(pick, pick_note(pick, chord_now, 1));
+    drone[pick].peak = 20000 + (int32_t)rnd(12768u);   /* each bloom a little different */
+    bloom_t[pick] = fm1_ms;
+    drone[pick].trig++;                         /* (last: the audio starts it with the note and peak above) */
+}
+static void pulse_move(void)                    /* a pulse through the network: one voice moves (or blooms); now and then the chord */
 {
     uint32_t v, w, n;
     pulse_ms = fm1_ms;
-    if (!moves_left) {                          /* the network shifts: a neighbour on the ring */
+    if (chord_every && !moves_left) {           /* the network shifts: a neighbour on the ring (CHORDS: HOLD never) */
         chord_now = (chord_now + (rnd(3u) ? 1u : 5u)) % 6u;
-        moves_left = 4u + rnd(3u);
+        moves_left = new_moves();
     }
-    moves_left--;
-    for (w = 0, v = DV; w < DV && v == DV; w++) /* a living voice outside the chord moves first, the bass before the rest */
+    if (moves_left) moves_left--;
+    if (engine) { bloom(); return; }
+    for (w = 0, v = DV; w < DV && v == DV; w++) /* a living voice outside the chord (or its window) moves first, the bass first */
         if (alive(w) && !fits(w, chord_now)) v = w;
     if (v < DV) { voice_to(v, pick_note(v, chord_now, 0)); return; }
     for (w = 1, n = 0; w < DV; w++) n += (uint32_t)alive(w);
@@ -454,7 +575,7 @@ static int lfo_tick(uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 whe
         else if (v > 0 && pulse.armed) { pulse.armed = 0; pulse_move(); }
     }
     if (lfo_advance(&season, dt, SEASON_S(sea) * 700u)) lfo_target(&season);
-    if (SEASON_S(sea)) {
+    if (sea) {
         v = lfo_random(&season);
         int ev = 0;
         if (season.zone != 1u && v > 16384) { season.zone = 1; ev = 1; }
@@ -476,11 +597,12 @@ static void grow_start(void)                    /* PLAY: plant the network on th
     if (!grow_rng) grow_rng = 1;
     chord_now = 0;
     for (v = 0; v < DV; v++) {
-        drone[v].note = (uint8_t)((RANGE_LO[v] + RANGE_HI[v]) / 2u);
+        drone[v].note = (uint8_t)(win_lo(v) + 6u);
+        drone[v].vib_inc = 4294967295u / 172u * (9u + rnd(3u)) / 2u;   /* a vibrato of 4.5 .. 5.5 Hz (per block) */
         drone[v].vgate = 0;
         drone[v].lfo_inc = 4294967295u / (172u * (7u + rnd(13u)));   /* a breath every 7..19 s */
     }
-    moves_left = 4u + rnd(3u);
+    moves_left = new_moves();
     lfo_reset();
     drone_on = 1;
     set_density(density);
@@ -543,16 +665,58 @@ static void draw_keys(uint32_t lit)             /* bit k: key k sounds */
     cv_blit(0, 140);
 }
 
-static const char *const TIM_NAME[NT] = {"MOSS", "LOAM", "MIST", "ROOT"};
+/* ---- the settings: one byte each, kept in flash; the F_ order is the struct's */
+#define NCHG 11u
+static const uint8_t CHG_N[NCHG] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16};   /* CHORDS: pulses a chord; 0: HOLD */
+#define NATT 14u
+#define NREL 14u
+static struct { uint8_t oct, ch, tim, den, key, pul, shp, sea, cut, res, spc, mix, eng, spr, pit, chg, att[2], rel[2], his, ton, crk, wob; } set;
+enum { F_OCT, F_CH, F_TIM, F_DEN, F_KEY, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_ENG, F_SPR, F_PIT, F_CHG,
+       F_ATT, F_ATT1, F_REL, F_REL1, F_HIS, F_TON, F_CRK, F_WOB, F_N, F_CPU = F_N };
+#define CFG ((uint8_t *)&set)
+static const uint8_t CFG_MIN[F_N] = {0, 0, 0, 1};   /* (the rest: 0) */
+static const uint8_t CFG_MAX[F_N] = {255, 16, NT - 1u, DV, 11, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u,
+    NSPACE - 1u, NMIX - 1u, 1, 8, 24, NCHG - 1u, NATT - 1u, NATT - 1u, NREL - 1u, NREL - 1u, 20, 10, 20, 10};
+static const uint8_t CFG_DEF[F_N] = {0, 0, 0, 4, 0, 4, 1, 0, NCUT - 1u, 0, 8, 5, 0, 8, 12, 5,
+    10, 4, 10, 8, 0, 5, 0, 0};                  /* DRONE: attack 3 s, release 6 s; BLOOM: 350 ms, 3 s */
+static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "TIMBRE", "DENSITY", "KEY", "PULSE", "SHAPE", "SEASON", "FILTER", "RES",
+    "SPACE", "MIX", "ENGINE", "SPREAD", "PITCH", "CHORDS", "ATTACK", "ATTACK", "RELEASE", "RELEASE", "HISS", "TONE", "CRACKLE",
+    "WOBBLE", "CPU"};
+/* the pages: HOME, SEL (the engine), LFO, FX 1, FX 2; F_ATT / F_REL mean the engine's own */
+enum { P_HOME, P_SEL, P_LFO, P_FX1, P_FX2, NPAGE };
+static const uint8_t PAGE_F[NPAGE][4] = {{F_DEN, F_SPR, F_PIT, F_CHG}, {F_ENG, F_TIM, F_ATT, F_REL}, {F_PUL, F_SHP, F_SEA, F_CPU},
+                                         {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}};
+static uint32_t page_field(uint32_t page, uint32_t k)
+{
+    uint32_t f = PAGE_F[page][k];
+    return f == F_ATT || f == F_REL ? f + set.eng : f;
+}
+static void apply(void)                         /* the settings to the sound */
+{
+    fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
+    tim_now = set.tim;
+    engine = set.eng;
+    env_att = ATT_INC[set.att[set.eng]];
+    env_rel = REL_K[set.rel[set.eng]];
+    spread = set.spr;
+    pitch = (int32_t)set.pit - 12;
+    chord_every = CHG_N[set.chg];
+    tex_hiss = HISS_G[set.his]; tex_tone = set.ton; tex_crk = CRK_T[set.crk];
+    wob_depth = WOB_D[set.wob];
+}
+
+static const char *const TIM_NAME[NT] = {"MOSS", "MIST", "CHOIR", "ORGAN", "REED"};
+static const char *const ENG_NAME[2] = {"DRONE", "BLOOM"};
 static void put(char **p, const char *a) { while (*a) *(*p)++ = *a++; }
 static void put_num(char **p, uint32_t n) { if (n >= 100u) *(*p)++ = (char)('0' + n / 100u); if (n >= 10u) *(*p)++ = (char)('0' + n / 10u % 10u); *(*p)++ = (char)('0' + n % 10u); }
+static void put_signed(char **p, int32_t n) { if (n) *(*p)++ = n < 0 ? '-' : '+'; put_num(p, (uint32_t)(n < 0 ? -n : n)); }
 
-static void draw_info(uint32_t key, uint32_t tim, int32_t oct, uint32_t ch, int lit)   /* "KEY C   MOSS   OCT +0" */
+static void draw_info(uint32_t key, int32_t oct, int lit)   /* "KEY C   DRONE   MOSS" (+ OCT, CH when set) */
 {
-    char s[32], *p = s;
-    put(&p, "KEY "); put(&p, KEY_NAME[key]); put(&p, "   "); put(&p, TIM_NAME[tim]);
-    put(&p, "   OCT "); *p++ = oct < 0 ? '-' : '+'; *p++ = (char)('0' + (oct < 0 ? -oct : oct));
-    if (ch) { put(&p, "  CH"); put_num(&p, ch); }
+    char s[40], *p = s;
+    put(&p, "KEY "); put(&p, KEY_NAME[key]); put(&p, "   "); put(&p, ENG_NAME[set.eng]); put(&p, "   "); put(&p, TIM_NAME[set.tim]);
+    if (oct) { put(&p, "  OCT"); *p++ = oct < 0 ? '-' : '+'; *p++ = (char)('0' + (oct < 0 ? -oct : oct)); }
+    if (set.ch) { put(&p, "  CH"); put_num(&p, set.ch); }
     *p = 0;
     draw_text_box(0, 52, 240, &FONT_S, s, lit ? C_ACC : C_OFF, 1);   /* (green a moment when the season moves the key) */
 }
@@ -564,49 +728,62 @@ static void fmt_season(char **p, uint32_t sea)   /* OFF, 45s, 1m, 1m15 */
     put_num(p, t / 60u); *(*p)++ = 'm';
     if (t % 60u) put_num(p, t % 60u);
 }
-/* the four knobs of the page: a name, its value, a bar; page 0 GROWTH, page 1 SOUND (FX switches) */
-static void draw_knobs(uint32_t page, const uint8_t *sv)   /* sv: den pul shp sea cut res spc mix */
+static void fmt_field(char **q, uint32_t f, uint32_t cpu)   /* a setting's value as the panel shows it */
 {
-    static const char *const NAME[2][4] = {{"DENSITY", "PULSE", "SHAPE", "SEASON"}, {"FILTER", "RES", "SPACE", "MIX"}};
-    static const uint8_t TOP[8] = {DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u, NMIX - 1u};
-    static const uint8_t BOT[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t v = f < F_N ? CFG[f] : 0u;
+    switch (f) {
+    case F_PIT: if (v == 12u) put(q, "0"); else put_signed(q, (int32_t)v - 12); break;
+    case F_CHG: if (CHG_N[v]) put_num(q, CHG_N[v]); else put(q, "HOLD"); break;
+    case F_ENG: put(q, ENG_NAME[v]); break;
+    case F_TIM: put(q, TIM_NAME[v]); break;
+    case F_ATT: case F_ATT1: put(q, ATT_LABEL[v]); break;
+    case F_REL: case F_REL1: put(q, REL_LABEL[v]); break;
+    case F_PUL: if (PULSE_S[v]) { put_num(q, PULSE_S[v]); *(*q)++ = 's'; } else put(q, "STILL"); break;
+    case F_SHP: put(q, SHAPE_NAME[v]); break;
+    case F_SEA: fmt_season(q, v); break;
+    case F_CUT: put(q, CUT_LABEL[v]); break;
+    case F_SPC: put(q, SPACE_LABEL[v]); break;
+    case F_MIX: put_num(q, v * 5u); *(*q)++ = '%'; break;
+    case F_TON: if (v == 5u) put(q, "WHITE"); else put_signed(q, (int32_t)v - 5); break;
+    case F_HIS: case F_CRK: case F_WOB: if (v) put_num(q, v); else put(q, "OFF"); break;
+    case F_CPU: if (cpu) { put_num(q, cpu); *(*q)++ = '%'; } else put(q, "--"); break;
+    default: put_num(q, v); break;
+    }
+}
+static uint32_t cfg_min(uint32_t f) { return f < 4u ? CFG_MIN[f] : 0u; }
+/* the four knobs of the page: a name, its value, a bar */
+static void draw_knobs(uint32_t page, uint32_t cpu)
+{
     uint32_t k;
     cv_begin(240, 50, C_BLACK);
     for (k = 0; k < 4u; k++) {
-        uint32_t i = page * 4u + k, x0 = k * 60u, w;
+        uint32_t f = page_field(page, k), x0 = k * 60u;
         char v[12], *q = v;
-        switch (i) {
-        case 0: put_num(&q, sv[0]); break;
-        case 1: if (PULSE_S[sv[1]]) { put_num(&q, PULSE_S[sv[1]]); *q++ = 's'; } else put(&q, "STILL"); break;
-        case 2: put(&q, SHAPE_NAME[sv[2]]); break;
-        case 3: fmt_season(&q, sv[3]); break;
-        case 4: put(&q, CUT_LABEL[sv[4]]); break;
-        case 5: put_num(&q, sv[5]); break;
-        case 6: put(&q, SPACE_LABEL[sv[6]]); break;
-        default: put_num(&q, (uint32_t)sv[7] * 5u); *q++ = '%'; break;
-        }
+        fmt_field(&q, f, cpu);
         *q = 0;
-        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, NAME[page][k])) / 2, 0, &FONT_S, NAME[page][k], C_OFF);
-        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, v)) / 2, 18, &FONT_S, v, C_ACC);
-        w = (uint32_t)(sv[i] - BOT[i]) * 46u / (uint32_t)(TOP[i] - BOT[i]);
-        cv_rect((int32_t)x0 + 7, 40, 46, 3, RGB(45, 45, 45));
-        if (w) cv_rect((int32_t)x0 + 7, 40, (int32_t)w, 3, C_ACC);
+        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, F_NAME[f])) / 2, 0, &FONT_S, F_NAME[f], C_OFF);
+        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, v)) / 2, 18, &FONT_S, v, f == F_CPU ? C_OFF : C_ACC);
+        if (f < F_N) {
+            uint32_t w = (CFG[f] - cfg_min(f)) * 46u / (CFG_MAX[f] - cfg_min(f));
+            cv_rect((int32_t)x0 + 7, 40, 46, 3, RGB(45, 45, 45));
+            if (w) cv_rect((int32_t)x0 + 7, 40, (int32_t)w, 3, C_ACC);
+        }
     }
     cv_blit(0, 148);
 }
-static void draw_hint(uint32_t page, uint32_t cpu)   /* the bottom line: what FX does; on the SOUND page, the CPU */
+static void draw_tabs(uint32_t page)            /* the bottom line: the pages, the one shown lit */
 {
-    char s[40], *p = s;
-    if (!page) put(&p, "FX: filter + reverb");
-    else {
-        put(&p, "FX: back to growth");
-        if (cpu) { put(&p, "   CPU "); put_num(&p, cpu); *p++ = '%'; }
-    }
-    *p = 0;
-    draw_text_box(0, 214, 240, &FONT_S, s, C_OFF, 1);
+    static const char *const TAB[NPAGE] = {"HOME", "SEL", "LFO", "FX1", "FX2"};
+    uint32_t i;
+    int32_t x, w = 0;
+    for (i = 0; i < NPAGE; i++) w += text_w(&FONT_S, TAB[i]) + (i ? 14 : 0);
+    x = (240 - w) / 2;
+    cv_begin(240, 16, C_BLACK);
+    for (i = 0; i < NPAGE; i++) x = cv_text(x, 0, &FONT_S, TAB[i], i == page ? C_ACC : RGB(65, 65, 65)) + 14;
+    cv_blit(0, 214);
 }
 
-static void draw_network(uint32_t den, uint32_t on, int flash)   /* density as nodes and threads: grown ones lit, the rest seeds */
+static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding)   /* nodes and threads: grown ones lit, the rest seeds; bit i: node i sounds */
 {
     static const int8_t DY[DV] = {2, -5, 4, -3, 5, -4};   /* a little unevenness, like something that grew */
     uint32_t i;
@@ -620,7 +797,7 @@ static void draw_network(uint32_t den, uint32_t on, int flash)   /* density as n
     }
     for (i = 0; i < DV; i++) {                  /* the nodes */
         int32_t x = 45 + (int32_t)i * 30, y = 13 + DY[i];
-        if (i < den) cv_rect(x - 4, y - 4, 9, 9, lit);
+        if (i < den) cv_rect(x - 4, y - 4, 9, 9, sounding >> i & 1u ? RGB(190, 235, 150) : lit);
         else cv_rect(x - 2, y - 2, 5, 5, seed);
     }
     cv_blit(0, 113);
@@ -646,7 +823,6 @@ static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)   /* where n
 }
 
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
-static struct { uint8_t oct, ch, tim, den, key, pul, shp, sea, cut, res, spc, mix; } set = {0, 0, 0, 4, 0, 4, 1, 0, NCUT - 1u, 0, 8, 5};   /* (key: on the circle of fifths) */   /* what survives a power-off (add yours, up to SECTOR_MAX bytes) */
 static uint32_t idle_ok, midi_src, clk_n, clk_t0, clk_bpm, clk_run, clk_beat_ms;
 
 static void midi_in(void)
@@ -683,7 +859,7 @@ static void app_idle(void)
 static void app_main(void)
 {
     uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, status_drawn = ~0u;
-    uint32_t midi_drawn = ~0u, lfo_drawn = ~0u, hint_drawn = ~0u, key_ms = 0, kl, fl, page = 0, cpu_pct = 0;
+    uint32_t midi_drawn = ~0u, lfo_drawn = ~0u, hint_drawn = ~0u, key_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0;
 #ifndef DINGHY_HOST
     uint32_t cpu_t = 0;
 #endif
@@ -694,16 +870,15 @@ static void app_main(void)
     smk_pw_t wheel = {0};
     smk_pad_events = 1;                         /* the pads as events (smk_pad_take): they play here, lit while they sound */
 #endif
-    if (settings_load(&set, sizeof set) || (int8_t)set.oct < -2 || (int8_t)set.oct > 2 || set.ch > 16u || set.tim >= NT || set.den < 1u || set.den > DV
-        || set.key > 11u || set.pul >= NPULSE || set.shp >= NSHAPE || set.sea >= NSEASON
-        || set.cut >= NCUT || set.res >= NRES || set.spc >= NSPACE || set.mix >= NMIX)
-        set.oct = 0, set.ch = 0, set.tim = 0, set.den = 4, set.key = 0, set.pul = 4, set.shp = 1, set.sea = 0,
-        set.cut = NCUT - 1u, set.res = 0, set.spc = 8, set.mix = 5;
-
-    tim_now = tim_prev = set.tim;
+    {                                           /* the settings: loaded, every one in its range, else all the defaults */
+        int ok = !settings_load(&set, sizeof set) && (int8_t)set.oct >= -2 && (int8_t)set.oct <= 2;
+        for (k = 1; ok && k < F_N; k++) ok = CFG[k] >= cfg_min(k) && CFG[k] <= CFG_MAX[k];
+        if (!ok) for (k = 0; k < F_N; k++) CFG[k] = CFG_DEF[k];
+    }
+    apply();
+    tim_prev = set.tim;
     density = set.den;
     key_now = set.key;
-    fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 18, 240, &FONT_L, APP_NAME, C_ACC, 1);
 
@@ -755,21 +930,25 @@ static void app_main(void)
             set.key = (uint8_t)key_now;
             dirty = 1; t_change = fm1_ms;
         }
-        if (b & (1u << BTN_FX)) page ^= 1u;    /* FX: the knobs' other page */
-        for (k = 0; k < 4u; k++)                /* KNOB 1..4: GROWTH (density, pulse, shape, season) or SOUND (filter, res, space, mix) */
+        if (b & (1u << BTN_HOME)) page = P_HOME;                    /* HOME: back home */
+        if (b & (1u << BTN_SEL)) page = page == P_SEL ? P_HOME : P_SEL;   /* SEL: the engine page (again: home) */
+        if (b & (1u << BTN_LFO)) page = page == P_LFO ? P_HOME : P_LFO;   /* LFO: the LFO page (again: home) */
+        if (b & (1u << BTN_FX)) page = page == P_FX1 ? P_FX2 : P_FX1;     /* FX: round the effect pages */
+        for (k = 0; k < 4u; k++)                /* KNOB 1..4: the page's four settings */
             if ((e = fm1_enc_take(ENC_KNOB1 + k)) != 0) {
-                static const uint8_t TOPS[8] = {DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u, NMIX - 1u};
-                uint8_t *sv[8] = {&set.den, &set.pul, &set.shp, &set.sea, &set.cut, &set.res, &set.spc, &set.mix};
-                uint32_t i = page * 4u + k;
-                int32_t d = (int32_t)*sv[i] + e, lo = i == 0u ? 1 : 0;
-                *sv[i] = (uint8_t)(d < lo ? lo : d > (int32_t)TOPS[i] ? (int32_t)TOPS[i] : d);
-                if (i == 0u) set_density(set.den);
-                fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
+                uint32_t f = page_field(page, k);
+                int32_t d;
+                if (f >= F_N) continue;         /* (a display, not a setting) */
+                d = (int32_t)CFG[f] + e;
+                CFG[f] = (uint8_t)(d < (int32_t)cfg_min(f) ? (int32_t)cfg_min(f) : d > (int32_t)CFG_MAX[f] ? (int32_t)CFG_MAX[f] : d);
+                apply();
+                if (f == F_DEN) set_density(set.den);
+                if (f == F_SPR || f == F_PIT) revoice();
                 dirty = 1; t_change = fm1_ms;
             }
-        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the timbre, round the ring */
+        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the timbre, round the ring (as SEL's KNOB 2) */
             set.tim = (uint8_t)(((int32_t)set.tim + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
-            tim_now = set.tim;
+            apply();
             dirty = 1;
             t_change = fm1_ms;
         }
@@ -797,13 +976,15 @@ static void app_main(void)
         for (k = 0; k < NV; k++)                /* what sounds, on the keys of this octave */
             if (voice[k].gate && voice[k].note >= base && voice[k].note < base + 27u)
                 lit |= 1u << (voice[k].note - base);
-        if (drone_on)                           /* the network's notes light up too */
-            for (k = 0; k < DV; k++)
-                if (drone[k].vgate && drone[k].note >= base && drone[k].note < base + 27u)
-                    lit |= 1u << (drone[k].note - base);
+        for (k = 0; k < DV; k++)                /* the network's sounding notes light up too */
+            if (drone[k].vamp > 2000 && drone[k].note >= base && drone[k].note < base + 27u)
+                lit |= 1u << (drone[k].note - base);
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
-        fm1_led_key(BTN_FX, page);              /* lit: the knobs are on the SOUND page */
+        fm1_led_key(BTN_HOME, page == P_HOME);  /* the page's button lit */
+        fm1_led_key(BTN_SEL, page == P_SEL);
+        fm1_led_key(BTN_LFO, page == P_LFO);
+        fm1_led_key(BTN_FX, page == P_FX1 || page == P_FX2);
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
         fm1_led_key(BTN_PLAY, drone_on || clk_run || (clk_bpm && fm1_ms - clk_beat_ms < 80u));   /* lit: growing */
@@ -818,13 +999,10 @@ static void app_main(void)
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
         if ((st = drone_on ? 1000u + chord_now + key_now * 8u : last_note) != note_drawn) { note_drawn = st; draw_note(); }
         kl = key_ms && fm1_ms - key_ms < 3000u;
-        if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4 | (uint32_t)set.tim << 9 | key_now << 11 | kl << 15) != status_drawn) { status_drawn = st; draw_info(key_now, set.tim, oct, set.ch, kl); }
-        {
-            const uint8_t sv[8] = {set.den, set.pul, set.shp, set.sea, set.cut, set.res, set.spc, set.mix};
-            st = page ? 1u << 31 | set.cut | (uint32_t)set.res << 5 | (uint32_t)set.spc << 9 | (uint32_t)set.mix << 13
-                      : set.den | (uint32_t)set.pul << 3 | (uint32_t)set.shp << 7 | (uint32_t)set.sea << 9;
-            if (st != lfo_drawn) { lfo_drawn = st; draw_knobs(page, sv); }
-        }
+        if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4 | (uint32_t)set.tim << 9 | key_now << 12 | kl << 16 | (uint32_t)set.eng << 17) != status_drawn) { status_drawn = st; draw_info(key_now, oct, kl); }
+        st = page | cpu_pct << 3;               /* the panel: redrawn when the page, a value on it or the CPU changes */
+        for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
+        if (st != lfo_drawn) { lfo_drawn = st; draw_knobs(page, cpu_pct); }
 #ifndef DINGHY_HOST
         if (fm1_ms - cpu_t >= 1000u) {          /* the audio ISR's worst run of the last second, of its 5.8 ms */
             cpu_t = fm1_ms;
@@ -832,9 +1010,11 @@ static void app_main(void)
             cpu_max_us = 0;
         }
 #endif
-        if ((st = page | (page ? cpu_pct << 1 : 0u)) != hint_drawn) { hint_drawn = st; draw_hint(page, cpu_pct); }
+        if (page != hint_drawn) { hint_drawn = page; draw_tabs(page); }
         fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
-        if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5) != midi_drawn) { midi_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl); }   /* (the MIDI line's place) */
+        snd = 0;                                /* BLOOM: the nodes of the voices sounding now */
+        if (set.eng) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
+        if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5 | snd << 6) != midi_drawn) { midi_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl, snd); }
         idle_ok = 0;
 
         if (dirty && quiet() && fm1_ms - t_change > 2000u) {   /* 2 s after the change, when silent (an erase stalls the sound) */
