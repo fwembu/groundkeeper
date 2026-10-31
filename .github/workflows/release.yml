@@ -7,6 +7,7 @@ name: release
 on:
   push:
     tags: ['v*']
+    branches: [main]           # Groundkeeper: every change to main builds, and becomes the test build
   workflow_dispatch:
 
 jobs:
@@ -65,6 +66,26 @@ jobs:
           sh build.sh --release "$V"
           ls -l build/dinghy-"$V"*.fwsc
           (cd build && sha256sum dinghy-"$V"*.fwsc > SHA256SUMS)
+
+      # Groundkeeper: the test build. Every build of main replaces the pre-release "test-build", whose files anyone can
+      # download without signing in: tools/windows/INSTALL-GROUNDKEEPER.bat fetches them and installs over USB.
+      - name: Publish the test build (main only)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p testbuild
+          cp build/dinghy.fwsc testbuild/groundkeeper.fwsc
+          cp tools/fm1_install.py tools/windows/INSTALL-GROUNDKEEPER.bat testbuild/
+          {
+            echo "  Test build of $(date -u '+%d %b %Y, %H:%M') UTC  (commit ${GITHUB_SHA::7})"
+            echo "  $(git log -1 --format=%s)"
+          } > testbuild/BUILD.txt
+          cat testbuild/BUILD.txt
+          gh release delete test-build --yes --cleanup-tag || true
+          gh release create test-build testbuild/* --prerelease --target "$GITHUB_SHA" \
+            --title "Test build" \
+            --notes "The newest build of main, replaced on every change. To install it: run INSTALL-GROUNDKEEPER.bat (Windows), or python3 fm1_install.py groundkeeper.fwsc. $(git log -1 --format=%s)"
 
       - uses: actions/upload-artifact@v4
         with:
