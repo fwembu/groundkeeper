@@ -79,7 +79,7 @@ static int32_t shape(uint32_t t, uint32_t pa, uint32_t pb, int32_t breath)   /* 
     }
 }
 
-static void drone_audio(int32_t *out, uint32_t n)
+static void drone_audio(int32_t *bus, uint32_t n)   /* adds the drone, mono, to bus */
 {
     uint32_t v, i;
     int32_t lvl = drone_lvl;
@@ -113,19 +113,127 @@ static void drone_audio(int32_t *out, uint32_t n)
             s = shape(tim_now, pa, pb, breath);
             if (tim_xf < 32767)
                 s = (s * (int32_t)(tim_xf >> 1) + shape(tim_prev, pa, pb, breath) * (int32_t)((32767u - tim_xf) >> 1)) >> 14;   /* (signed; no overflow) */
-            s = (s * g) >> 15;
-            out[2u * i] += s;
-            out[2u * i + 1u] += s;
+            bus[i] += (s * g) >> 15;
         }
         drone[v].pa = pa;
         drone[v].pb = pb;
     }
 }
 
+/* ---- the sound around the drone (audio ISR): a resonant low-pass, then a reverb, then dry + wet out in stereo
+ * FILTER: a state-variable low-pass (Chamberlin), run twice a sample so it stays stable up to 12 kHz; its states carry
+ * 4 extra bits so the low cutoffs stay smooth. RES: its Q, with the input turned down as the resonance rises.
+ * REVERB: four delay lines (50..95 ms) that feed back into each other through a Hadamard matrix, each with a soft
+ * low-pass (a forest, not a tiled room), after two allpasses that blur the attack; L and R take different lines.
+ * SPACE sets the feedback (a decay of 0.6 s .. 16 s), MIX dry against wet. The coefficients glide (no zipper noise),
+ * and a soft limiter keeps a resonant peak from clipping. The tail runs on ~20 s after the drone fades, then rests. */
+#ifdef DINGHY_HOST
+#define POOL
+#else
+#define POOL __attribute__((section(".pool")))   /* (the pool: big buffers, zeroed at boot) */
+#endif
+/* (computed on a computer, tools in the commit message: no float on the chip) */
+static const uint16_t CUT_F[25] = {187, 227, 275, 335, 406, 494, 600, 728, 885, 1074, 1305, 1585, 1925, 2338, 2839, 3448, 4187, 5084, 6172, 7491, 9090, 11023, 13359, 16171, 27167};   /* 2 sin(pi fc / 2FS), Q15: 80 Hz .. 7 kHz in 24 steps, then OPEN (12 kHz) */
+static const char *const CUT_LABEL[25] = {"80", "100", "120", "140", "170", "210", "260", "310", "380", "460", "560", "680", "820", "1.0k", "1.2k", "1.5k", "1.8k", "2.2k", "2.6k", "3.2k", "3.9k", "4.7k", "5.8k", "7.0k", "OPEN"};
+static const uint16_t RES_Q[16] = {46348, 40681, 35707, 31342, 27510, 24146, 21194, 18603, 16328, 14332, 12580, 11041, 9691, 8507, 7466, 6554};   /* 1/Q, Q15: Q 0.71 .. 5 */
+static const uint16_t RES_COMP[16] = {32768, 31676, 30518, 29297, 28020, 26694, 25329, 23935, 22522, 21103, 19689, 18293, 16926, 15598, 14318, 13094};   /* input gain, Q15: the resonance's boost taken back */
+static const uint16_t SPACE_G[16] = {14228, 16764, 19125, 21260, 23148, 24785, 26183, 27364, 28351, 29169, 29844, 30398, 30850, 31218, 31517, 31759};   /* feedback, Q15: a decay of 0.6 s .. 16 s */
+static const char *const SPACE_LABEL[16] = {"0.6s", "0.7s", "0.9s", "1.2s", "1.4s", "1.8s", "2.2s", "2.8s", "3.5s", "4.3s", "5.4s", "6.7s", "8.3s", "10s", "13s", "16s"};
+
+#define NCUT 25u
+#define NRES 16u
+#define NSPACE 16u
+#define NMIX 21u                                /* 0 .. 100 % in 5 % steps */
+static volatile uint32_t fx_cut = NCUT - 1u, fx_res, fx_space = 8, fx_mix = 5;   /* (main loop writes) */
+static int32_t f_now = 27167, q_now = 46348, c_now = 32768, g_now, m_now;   /* the gliding coefficients */
+static int32_t sv_lp, sv_bp;                    /* the filter's states (x16) */
+#define RV0 2203u
+#define RV1 2851u
+#define RV2 3517u
+#define RV3 4211u
+#define AP0 142u
+#define AP1 379u
+static int16_t rv0[RV0] POOL, rv1[RV1] POOL, rv2[RV2] POOL, rv3[RV3] POOL, ap0[AP0] POOL, ap1[AP1] POOL;
+static uint32_t ri0, ri1, ri2, ri3, ai0, ai1, rv_rest;
+static int32_t dm0, dm1, dm2, dm3;              /* the lines' damping states */
+#define RV_DAMP 18022                           /* the lines' low-pass, Q15: ~5.6 kHz */
+#define RV_DIFF 20480                           /* the allpasses' gain, Q15: 0.625 */
+#define RV_TAIL (44100u * 20u)                  /* frames the reverb runs on after its input goes quiet */
+
+static int32_t sat16(int32_t x) { return x > 32767 ? 32767 : x < -32767 ? -32767 : x; }
+static int32_t glide(int32_t now, int32_t to) { int32_t d = to - now; return d > -8 && d < 8 ? to : now + (d >> 3); }
+static int32_t soft(int32_t x)                  /* above 3/4 of full scale, a quarter as steep */
+{
+    return x > 24576 ? 24576 + ((x - 24576) >> 2) : x < -24576 ? -24576 + ((x + 24576) >> 2) : x;
+}
+
+static void fx_audio(const int32_t *bus, int32_t *out, uint32_t n, int quiet_in)
+{
+    uint32_t i, k;
+    int32_t f, q, c, g, m, dry;
+    f_now = glide(f_now, CUT_F[fx_cut]);
+    q_now = glide(q_now, RES_Q[fx_res]);
+    c_now = glide(c_now, RES_COMP[fx_res]);
+    g_now = glide(g_now, SPACE_G[fx_space]);
+    m_now = glide(m_now, (int32_t)fx_mix * 1638);   /* 0 .. 32760 */
+    if (quiet_in) {
+        if (rv_rest >= RV_TAIL) { sv_lp = sv_bp = 0; return; }   /* all quiet: costs nothing */
+        rv_rest += n;
+    } else rv_rest = 0;
+    f = f_now; q = q_now; c = c_now; g = g_now; m = m_now;
+    dry = 32767 - (m >> 1);                     /* at MIX 100 % the dry is half */
+    for (i = 0; i < n; i++) {
+        int32_t x = (int32_t)(((int64_t)bus[i] * c) >> 15) << 4, y, l = 0, r = 0;
+        for (k = 0; k < 2u; k++) {              /* the filter, twice a sample */
+            int32_t hp;
+            sv_lp += (int32_t)(((int64_t)f * sv_bp) >> 15);
+            hp = x - sv_lp - (int32_t)(((int64_t)q * sv_bp) >> 15);
+            sv_bp += (int32_t)(((int64_t)f * hp) >> 15);
+        }
+        y = sv_lp >> 4;
+        if (m) {                                /* the reverb */
+            int32_t in = y >> 2, v, t, y0, y1, y2, y3, a, b, cc, e;
+            v = in - ((RV_DIFF * ap0[ai0]) >> 15); t = ap0[ai0] + ((RV_DIFF * v) >> 15); ap0[ai0] = (int16_t)sat16(v);
+            if (++ai0 == AP0) ai0 = 0;
+            v = t - ((RV_DIFF * ap1[ai1]) >> 15); in = ap1[ai1] + ((RV_DIFF * v) >> 15); ap1[ai1] = (int16_t)sat16(v);
+            if (++ai1 == AP1) ai1 = 0;
+            y0 = rv0[ri0]; y1 = rv1[ri1]; y2 = rv2[ri2]; y3 = rv3[ri3];
+            dm0 += ((y0 - dm0) * RV_DAMP + 16384) >> 15; dm1 += ((y1 - dm1) * RV_DAMP + 16384) >> 15;   /* (rounded: */
+            dm2 += ((y2 - dm2) * RV_DAMP + 16384) >> 15; dm3 += ((y3 - dm3) * RV_DAMP + 16384) >> 15;   /*  no drift) */
+            a = dm0 + dm1; b = dm0 - dm1; cc = dm2 + dm3; e = dm2 - dm3;   /* Hadamard: (a+c, b+e, a-c, b-e) / 2 */
+            rv0[ri0] = (int16_t)sat16(in + ((((b + e) >> 1) * g + 16384) >> 15));   /* (Hadamard, then rotated a */
+            rv1[ri1] = (int16_t)sat16(-in + ((((a - cc) >> 1) * g + 16384) >> 15)); /*  line: a Hadamard alone */
+            rv2[ri2] = (int16_t)sat16(in + ((((b - e) >> 1) * g + 16384) >> 15));   /*  swaps two patterns back */
+            rv3[ri3] = (int16_t)sat16(-in + ((((a + cc) >> 1) * g + 16384) >> 15)); /*  and forth; this spreads) */
+            if (++ri0 == RV0) ri0 = 0;
+            if (++ri1 == RV1) ri1 = 0;
+            if (++ri2 == RV2) ri2 = 0;
+            if (++ri3 == RV3) ri3 = 0;
+            l = ((y0 + y1 - y2 - y3) * (m >> 1)) >> 15;   /* L and R: two sign patterns across all four lines, */
+            r = ((y0 - y1 - y2 + y3) * (m >> 1)) >> 15;   /* orthogonal to the input's: decorrelated */
+        }
+        y = (y * dry) >> 15;
+        out[2u * i] += soft(y + l);
+        out[2u * i + 1u] += soft(y + r);
+    }
+}
+
+#define BUS_N 256u
+static int32_t bus[BUS_N];
+#ifndef DINGHY_HOST
+static volatile uint32_t cpu_max_us;            /* the audio ISR's longest run since the main loop last looked */
+#endif
+
 static void app_audio(int32_t *out, uint32_t n)
 {
     uint32_t v, i;
-    drone_audio(out, n);
+#ifndef DINGHY_HOST
+    uint32_t t0 = fm1_ticks(), us;
+#endif
+    if (n > BUS_N) n = BUS_N;
+    for (i = 0; i < n; i++) bus[i] = 0;
+    drone_audio(bus, n);
+    fx_audio(bus, out, n, drone_lvl == 0);
     for (v = 0; v < NV; v++) {
         uint32_t ph = voice[v].ph, step = (uint32_t)(((uint64_t)voice[v].inc * bend_q16) >> 16);   /* (int64 multiply: fine) */
         int32_t amp = voice[v].amp, g = voice[v].gate;
@@ -143,6 +251,10 @@ static void app_audio(int32_t *out, uint32_t n)
         voice[v].ph = ph;
         voice[v].amp = amp;
     }
+#ifndef DINGHY_HOST
+    us = (fm1_ticks() - t0) / FM1_TICKS_PER_US;
+    if (us > cpu_max_us) cpu_max_us = us;
+#endif
 }
 
 /* ---- notes (main loop) */
@@ -289,7 +401,7 @@ static void pulse_move(void)                    /* a pulse through the network: 
 /* ---- the LFOs (main loop, per ms; nothing here runs in the audio ISR)
  * PULSE moves the voicings: a move each time its wave rises through the middle. SINE: regular; RANDOM: a smooth random
  * wave (a new target each quarter cycle, a raised-cosine glide to it), so the moves come irregularly; MIX: the two summed.
- * SEASON moves the key: a slow random wave; each time it peaks high or dips low, the key takes a step round the circle
+ * SEASON (OFF, 15 s .. 10 min in 15 s steps) moves the key: a slow random wave; each time it peaks high or dips low, the key takes a step round the circle
  * of fifths. It keeps travelling the same way, turning back a third of the time, so over the hours it wanders through
  * the keys (high = sharpwards, low = flatwards made a pendulum between two keys). Its cycle is 0.7 of the setting: a
  * key change comes about once per setting, on average. */
@@ -301,8 +413,8 @@ static int32_t season_dir = 1;                  /* +1: travelling sharpwards rou
 static const uint16_t PULSE_S[NPULSE] = {0, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};   /* seconds a cycle; 0: STILL */
 #define NSHAPE 3u
 static const char *const SHAPE_NAME[NSHAPE] = {"SINE", "MIX", "RANDOM"};
-#define NSEASON 7u
-static const uint16_t SEASON_S[NSEASON] = {0, 30, 60, 120, 240, 480, 960};   /* seconds; 0: OFF */
+#define NSEASON 41u                             /* OFF, then 15 s .. 10 min in 15 s steps */
+#define SEASON_S(i) ((uint32_t)(i) * 15u)
 
 static int lfo_advance(lfo_t *l, uint32_t dt, uint32_t ms)   /* 1: a new random segment began (pick the next target) */
 {
@@ -341,8 +453,8 @@ static int lfo_tick(uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 whe
         if (v < -4000) pulse.armed = 1;         /* (below the middle first: one move per rise) */
         else if (v > 0 && pulse.armed) { pulse.armed = 0; pulse_move(); }
     }
-    if (lfo_advance(&season, dt, SEASON_S[sea] * 700u)) lfo_target(&season);
-    if (SEASON_S[sea]) {
+    if (lfo_advance(&season, dt, SEASON_S(sea) * 700u)) lfo_target(&season);
+    if (SEASON_S(sea)) {
         v = lfo_random(&season);
         int ev = 0;
         if (season.zone != 1u && v > 16384) { season.zone = 1; ev = 1; }
@@ -444,19 +556,54 @@ static void draw_info(uint32_t key, uint32_t tim, int32_t oct, uint32_t ch, int 
     *p = 0;
     draw_text_box(0, 52, 240, &FONT_S, s, lit ? C_ACC : C_OFF, 1);   /* (green a moment when the season moves the key) */
 }
-static void draw_lfos(uint32_t pul, uint32_t shp, uint32_t sea)   /* "PULSE 6s MIX   SEASON 4m" */
+static void fmt_season(char **p, uint32_t sea)   /* OFF, 45s, 1m, 1m15 */
 {
-    char s[32], *p = s;
-    uint32_t t = SEASON_S[sea];
-    put(&p, "PULSE ");
-    if (PULSE_S[pul]) { put_num(&p, PULSE_S[pul]); put(&p, "s "); put(&p, SHAPE_NAME[shp]); }
-    else put(&p, "STILL");
-    put(&p, "   SEASON ");
-    if (!t) put(&p, "OFF");
-    else if (t < 60u) { put_num(&p, t); *p++ = 's'; }
-    else { put_num(&p, t / 60u); *p++ = 'm'; }
+    uint32_t t = SEASON_S(sea);
+    if (!t) { put(p, "OFF"); return; }
+    if (t < 60u) { put_num(p, t); *(*p)++ = 's'; return; }
+    put_num(p, t / 60u); *(*p)++ = 'm';
+    if (t % 60u) put_num(p, t % 60u);
+}
+/* the four knobs of the page: a name, its value, a bar; page 0 GROWTH, page 1 SOUND (FX switches) */
+static void draw_knobs(uint32_t page, const uint8_t *sv)   /* sv: den pul shp sea cut res spc mix */
+{
+    static const char *const NAME[2][4] = {{"DENSITY", "PULSE", "SHAPE", "SEASON"}, {"FILTER", "RES", "SPACE", "MIX"}};
+    static const uint8_t TOP[8] = {DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u, NMIX - 1u};
+    static const uint8_t BOT[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t k;
+    cv_begin(240, 50, C_BLACK);
+    for (k = 0; k < 4u; k++) {
+        uint32_t i = page * 4u + k, x0 = k * 60u, w;
+        char v[12], *q = v;
+        switch (i) {
+        case 0: put_num(&q, sv[0]); break;
+        case 1: if (PULSE_S[sv[1]]) { put_num(&q, PULSE_S[sv[1]]); *q++ = 's'; } else put(&q, "STILL"); break;
+        case 2: put(&q, SHAPE_NAME[sv[2]]); break;
+        case 3: fmt_season(&q, sv[3]); break;
+        case 4: put(&q, CUT_LABEL[sv[4]]); break;
+        case 5: put_num(&q, sv[5]); break;
+        case 6: put(&q, SPACE_LABEL[sv[6]]); break;
+        default: put_num(&q, (uint32_t)sv[7] * 5u); *q++ = '%'; break;
+        }
+        *q = 0;
+        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, NAME[page][k])) / 2, 0, &FONT_S, NAME[page][k], C_OFF);
+        cv_text((int32_t)x0 + (60 - text_w(&FONT_S, v)) / 2, 18, &FONT_S, v, C_ACC);
+        w = (uint32_t)(sv[i] - BOT[i]) * 46u / (uint32_t)(TOP[i] - BOT[i]);
+        cv_rect((int32_t)x0 + 7, 40, 46, 3, RGB(45, 45, 45));
+        if (w) cv_rect((int32_t)x0 + 7, 40, (int32_t)w, 3, C_ACC);
+    }
+    cv_blit(0, 148);
+}
+static void draw_hint(uint32_t page, uint32_t cpu)   /* the bottom line: what FX does; on the SOUND page, the CPU */
+{
+    char s[40], *p = s;
+    if (!page) put(&p, "FX: filter + reverb");
+    else {
+        put(&p, "FX: back to growth");
+        if (cpu) { put(&p, "   CPU "); put_num(&p, cpu); *p++ = '%'; }
+    }
     *p = 0;
-    draw_text_box(0, 212, 240, &FONT_S, s, C_OFF, 1);
+    draw_text_box(0, 214, 240, &FONT_S, s, C_OFF, 1);
 }
 
 static void draw_network(uint32_t den, uint32_t on, int flash)   /* density as nodes and threads: grown ones lit, the rest seeds */
@@ -499,7 +646,7 @@ static void draw_midi(uint32_t src, uint32_t bpm, uint32_t running)   /* where n
 }
 
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
-static struct { uint8_t oct, ch, tim, den, key, pul, shp, sea; } set = {0, 0, 0, 4, 0, 4, 1, 0};   /* (key: on the circle of fifths) */   /* what survives a power-off (add yours, up to SECTOR_MAX bytes) */
+static struct { uint8_t oct, ch, tim, den, key, pul, shp, sea, cut, res, spc, mix; } set = {0, 0, 0, 4, 0, 4, 1, 0, NCUT - 1u, 0, 8, 5};   /* (key: on the circle of fifths) */   /* what survives a power-off (add yours, up to SECTOR_MAX bytes) */
 static uint32_t idle_ok, midi_src, clk_n, clk_t0, clk_bpm, clk_run, clk_beat_ms;
 
 static void midi_in(void)
@@ -535,8 +682,11 @@ static void app_idle(void)
 
 static void app_main(void)
 {
-    uint32_t prev = 0, k, t_change = 0, dirty = 0, lit_drawn = ~0u, note_drawn = ~0u, status_drawn = ~0u;
-    uint32_t midi_drawn = ~0u, lfo_drawn = ~0u, key_ms = 0, kl, fl;
+    uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, status_drawn = ~0u;
+    uint32_t midi_drawn = ~0u, lfo_drawn = ~0u, hint_drawn = ~0u, key_ms = 0, kl, fl, page = 0, cpu_pct = 0;
+#ifndef DINGHY_HOST
+    uint32_t cpu_t = 0;
+#endif
     uint8_t held[27] = {0};                     /* the note each key plays */
 #if BOARD_SMK37
     static const uint8_t WHITE[16] = {0, 2, 4, 6, 7, 9, 11, 12, 14, 16, 18, 19, 21, 23, 24, 26};   /* white key -> key */
@@ -545,12 +695,15 @@ static void app_main(void)
     smk_pad_events = 1;                         /* the pads as events (smk_pad_take): they play here, lit while they sound */
 #endif
     if (settings_load(&set, sizeof set) || (int8_t)set.oct < -2 || (int8_t)set.oct > 2 || set.ch > 16u || set.tim >= NT || set.den < 1u || set.den > DV
-        || set.key > 11u || set.pul >= NPULSE || set.shp >= NSHAPE || set.sea >= NSEASON)
-        set.oct = 0, set.ch = 0, set.tim = 0, set.den = 4, set.key = 0, set.pul = 4, set.shp = 1, set.sea = 0;
+        || set.key > 11u || set.pul >= NPULSE || set.shp >= NSHAPE || set.sea >= NSEASON
+        || set.cut >= NCUT || set.res >= NRES || set.spc >= NSPACE || set.mix >= NMIX)
+        set.oct = 0, set.ch = 0, set.tim = 0, set.den = 4, set.key = 0, set.pul = 4, set.shp = 1, set.sea = 0,
+        set.cut = NCUT - 1u, set.res = 0, set.spc = 8, set.mix = 5;
 
     tim_now = tim_prev = set.tim;
     density = set.den;
     key_now = set.key;
+    fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 18, 240, &FONT_L, APP_NAME, C_ACC, 1);
 
@@ -595,13 +748,6 @@ static void app_main(void)
         b = fm1_input_edges(&rel);              /* buttons pressed since the last call (bit = button id) */
         if (b & (1u << BTN_OCT_DOWN) && oct > -2) { set.oct = (uint8_t)(oct - 1); dirty = 1; t_change = fm1_ms; }
         if (b & (1u << BTN_OCT_UP) && oct < 2) { set.oct = (uint8_t)(oct + 1); dirty = 1; t_change = fm1_ms; }
-        if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {      /* KNOB 1: density, how mature the network is (1..6) */
-            int32_t d = (int32_t)set.den + e;
-            set.den = (uint8_t)(d < 1 ? 1 : d > (int32_t)DV ? (int32_t)DV : d);
-            set_density(set.den);
-            dirty = 1;
-            t_change = fm1_ms;
-        }
         if ((e = fm1_enc_take(ENC_SELECT)) != 0) {     /* SELECT: the key, round the circle of fifths (pivoting, as the season) */
             int32_t i = e > 11 ? 11 : e < -11 ? -11 : e;
             for (; i > 0; i--) key_step(1);
@@ -609,21 +755,18 @@ static void app_main(void)
             set.key = (uint8_t)key_now;
             dirty = 1; t_change = fm1_ms;
         }
-        if ((e = fm1_enc_take(ENC_KNOB2)) != 0) {      /* KNOB 2: the pulse's speed (STILL, 2 s .. 64 s a cycle) */
-            int32_t d = (int32_t)set.pul + e;
-            set.pul = (uint8_t)(d < 0 ? 0 : d >= (int32_t)NPULSE ? (int32_t)NPULSE - 1 : d);
-            dirty = 1; t_change = fm1_ms;
-        }
-        if ((e = fm1_enc_take(ENC_KNOB3)) != 0) {      /* KNOB 3: the pulse's shape (SINE, MIX, RANDOM) */
-            int32_t d = (int32_t)set.shp + e;
-            set.shp = (uint8_t)(d < 0 ? 0 : d >= (int32_t)NSHAPE ? (int32_t)NSHAPE - 1 : d);
-            dirty = 1; t_change = fm1_ms;
-        }
-        if ((e = fm1_enc_take(ENC_KNOB4)) != 0) {      /* KNOB 4: the season's speed (OFF, about every 30 s .. 16 min) */
-            int32_t d = (int32_t)set.sea + e;
-            set.sea = (uint8_t)(d < 0 ? 0 : d >= (int32_t)NSEASON ? (int32_t)NSEASON - 1 : d);
-            dirty = 1; t_change = fm1_ms;
-        }
+        if (b & (1u << BTN_FX)) page ^= 1u;    /* FX: the knobs' other page */
+        for (k = 0; k < 4u; k++)                /* KNOB 1..4: GROWTH (density, pulse, shape, season) or SOUND (filter, res, space, mix) */
+            if ((e = fm1_enc_take(ENC_KNOB1 + k)) != 0) {
+                static const uint8_t TOPS[8] = {DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u, NMIX - 1u};
+                uint8_t *sv[8] = {&set.den, &set.pul, &set.shp, &set.sea, &set.cut, &set.res, &set.spc, &set.mix};
+                uint32_t i = page * 4u + k;
+                int32_t d = (int32_t)*sv[i] + e, lo = i == 0u ? 1 : 0;
+                *sv[i] = (uint8_t)(d < lo ? lo : d > (int32_t)TOPS[i] ? (int32_t)TOPS[i] : d);
+                if (i == 0u) set_density(set.den);
+                fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
+                dirty = 1; t_change = fm1_ms;
+            }
         if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the timbre, round the ring */
             set.tim = (uint8_t)(((int32_t)set.tim + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
             tim_now = set.tim;
@@ -660,6 +803,7 @@ static void app_main(void)
                     lit |= 1u << (drone[k].note - base);
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
+        fm1_led_key(BTN_FX, page);              /* lit: the knobs are on the SOUND page */
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
         fm1_led_key(BTN_PLAY, drone_on || clk_run || (clk_bpm && fm1_ms - clk_beat_ms < 80u));   /* lit: growing */
@@ -672,11 +816,23 @@ static void app_main(void)
 #endif
 
         idle_ok = 1;                            /* the drawing below may read MIDI meanwhile (LCD_IDLE) */
-        if (lit != lit_drawn) { lit_drawn = lit; draw_keys(lit); }   /* redraw only what changed */
         if ((st = drone_on ? 1000u + chord_now + key_now * 8u : last_note) != note_drawn) { note_drawn = st; draw_note(); }
         kl = key_ms && fm1_ms - key_ms < 3000u;
         if ((st = (uint32_t)(oct + 2) | (uint32_t)set.ch << 4 | (uint32_t)set.tim << 9 | key_now << 11 | kl << 15) != status_drawn) { status_drawn = st; draw_info(key_now, set.tim, oct, set.ch, kl); }
-        if ((st = set.pul | (uint32_t)set.shp << 4 | (uint32_t)set.sea << 6) != lfo_drawn) { lfo_drawn = st; draw_lfos(set.pul, set.shp, set.sea); }
+        {
+            const uint8_t sv[8] = {set.den, set.pul, set.shp, set.sea, set.cut, set.res, set.spc, set.mix};
+            st = page ? 1u << 31 | set.cut | (uint32_t)set.res << 5 | (uint32_t)set.spc << 9 | (uint32_t)set.mix << 13
+                      : set.den | (uint32_t)set.pul << 3 | (uint32_t)set.shp << 7 | (uint32_t)set.sea << 9;
+            if (st != lfo_drawn) { lfo_drawn = st; draw_knobs(page, sv); }
+        }
+#ifndef DINGHY_HOST
+        if (fm1_ms - cpu_t >= 1000u) {          /* the audio ISR's worst run of the last second, of its 5.8 ms */
+            cpu_t = fm1_ms;
+            cpu_pct = cpu_max_us * 100u / 5805u;
+            cpu_max_us = 0;
+        }
+#endif
+        if ((st = page | (page ? cpu_pct << 1 : 0u)) != hint_drawn) { hint_drawn = st; draw_hint(page, cpu_pct); }
         fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
         if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5) != midi_drawn) { midi_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl); }   /* (the MIDI line's place) */
         idle_ok = 0;
