@@ -1,0 +1,10 @@
+# GROW: KNOB 1 past 6, then PLAY: a seedling (the root alone) matures and withers by itself, a step every 15..35 s
+100 enc 2 3
+300 btn 12
+2000 shot
+45000 shot
+95000 shot
+150000 shot
+210000 shot
+300000 shot
+360000 end

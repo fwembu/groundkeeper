@@ -51,6 +51,7 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
  * rises to its peak (ATTACK), then fades (RELEASE), and leaves silence until the next one. */
 #include "gk_tables.h"
 #define DV 6u                                   /* the most voices the network can grow (density 6) */
+#define DEN_GROW (DV + 1u)                      /* DENSITY past 6: GROW, the network lives a slow life by itself */
 static struct {
     volatile uint32_t tinc;                     /* target phase step (main loop writes) */
     uint32_t inc;                               /* the step now: glides to tinc */
@@ -513,6 +514,21 @@ static void set_density(uint32_t d)             /* 1..6: voices grow in (planted
     }
     grow_ver++;
 }
+static uint32_t grow_next;                      /* GROW: when the network next grows or withers (fm1_ms) */
+static int32_t grow_dir = 1;                    /* GROW: +1 maturing, -1 withering */
+static void grow_wait(void) { grow_next = fm1_ms + 15000u + rnd(21u) * 1000u; }   /* a step every 15..35 s */
+static void grow_tick(int wild)                 /* GROW: now and then a voice grows in or withers, a life of minutes */
+{
+    if (!wild || !drone_on || (int32_t)(fm1_ms - grow_next) < 0) return;
+    grow_wait();
+    if (!rnd(8u)) grow_dir = -grow_dir;   /* (now and then it changes its mind) */
+    if (density >= DV) grow_dir = -1;           /* full grown: it begins to wither */
+    if (density <= 2u) grow_dir = 1;            /* down to the root and its third: it grows again (the root alone: a seedling) */
+    set_density((uint32_t)((int32_t)density + grow_dir));
+#ifdef DINGHY_HOST
+    printf("%7u ms  grow: %s to %u\n", (unsigned)fm1_ms, grow_dir > 0 ? "matures" : "withers", (unsigned)density);
+#endif
+}
 static void revoice(void)                       /* SPREAD or PITCH moved: every living voice to a chord note in its new window */
 {
     uint32_t v;
@@ -744,7 +760,7 @@ enum { F_OCT, F_CH, F_DEN, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_SP
 #define CFG ((uint8_t *)&set)
 static const uint8_t CFG_MIN[F_N] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0};
-static const uint8_t CFG_MAX[F_N] = {255, 16, DV, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u,
+static const uint8_t CFG_MAX[F_N] = {255, 16, DEN_GROW, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u,
     NMIX - 1u, 8, 24, NCHG - 1u, 20, 10, 20, 10, 200, NSPELL - 1u, 11, 11, 1, 20, NT - 1u, NT - 1u, NATT - 1u, NATT - 1u,
     NATT - 1u, NREL - 1u, NREL - 1u, NREL - 1u, 32, 32, 32, 32, 31, 31, NRATE - 1u, NRATE - 1u};
 static const uint8_t CFG_DEF[F_N] = {0, 0, 4, 8, 1, 0, NCUT - 1u, 0, 8, 5, 8, 12, 5, 0, 5, 0, 0, 90, 0, 0, 0, 0, 20,
@@ -904,11 +920,11 @@ static void draw_note(void)                     /* the chord: its root big, the 
         cv_text((132 - text_w(&FONT_S, "press PLAY")) / 2, 9, &FONT_S, "press PLAY", C_OFF);
     cv_blit(108, 48);
 }
-static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding)   /* nodes and threads: grown ones lit; bit i: node i sounds */
+static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding, int wild)   /* nodes and threads: grown ones lit; bit i: node i sounds; wild: GROW */
 {
     static const int8_t DY[DV] = {2, -5, 4, -3, 5, -4};   /* a little unevenness, like something that grew */
     uint32_t i;
-    uint16_t lit = flash ? C_GLOW : on ? C_ACC : RGB(70, 90, 60), seed = RGB(55, 55, 55);   /* a pulse: brighter a moment */
+    uint16_t lit = flash ? C_GLOW : on ? C_ACC : RGB(70, 90, 60), seed = wild ? RGB(60, 82, 50) : RGB(55, 55, 55);   /* a pulse: brighter a moment; GROW: the seeds green */
     cv_begin(132, 26, C_BLACK);
     for (i = 0; i + 1u < DV; i++) {
         int32_t x0 = 16 + (int32_t)i * 20, x1 = x0 + 20, y0 = 13 + DY[i], y1 = 13 + DY[i + 1u];
@@ -944,6 +960,7 @@ static void fmt_field(char **q, uint32_t f, uint32_t cpu)   /* a setting's value
     uint32_t v = f < F_N ? CFG[f] : 0u;
     switch (f) {
     case F_PIT: if (v == 12u) put(q, "0"); else put_signed(q, (int32_t)v - 12); break;
+    case F_DEN: if (v == DEN_GROW) put(q, "GROW"); else put_num(q, v); break;
     case F_CHG: if (CHG_N[v]) put_num(q, CHG_N[v]); else put(q, "HOLD"); break;
     case F_UMD: put(q, v ? "STABS" : "DRONE"); break;
     case F_TIM: case F_TIM1: put(q, TIM_NAME[v]); break;
@@ -1063,7 +1080,7 @@ static void app_main(void)
     scale_load();
     apply();
     tim_prev = tim_now;
-    density = set.den;
+    density = set.den == DEN_GROW ? 1u : set.den;   /* GROW: from a seedling */
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 4, 240, &FONT_S, APP_NAME, C_ACC, 1);
 
@@ -1135,7 +1152,8 @@ static void app_main(void)
                 if (f == F_SPL) set.scl = 0;    /* a new spell: from its first scale */
                 if (f == F_SPL || f == F_TNC || f == F_SCL) { cast(set.spl, set.tnc, set.scl); turn_ms = fm1_ms; }
                 apply();
-                if (f == F_DEN) set_density(set.den);
+                if (f == F_DEN && set.den == DEN_GROW) { grow_dir = density >= DV ? -1 : 1; grow_wait(); }   /* GROW: on from here */
+                else if (f == F_DEN) set_density(set.den);
                 if (f == F_SPR || f == F_PIT) revoice();
                 dirty = 1; t_change = fm1_ms;
             }
@@ -1152,12 +1170,17 @@ static void app_main(void)
 
         if (b & (1u << BTN_PLAY)) {             /* PLAY: grow, or let it fade back into the ground */
             if (drone_on) grow_stop();
-            else grow_start();
+            else {
+                if (set.den == DEN_GROW) { density = 1u; grow_dir = 1; }   /* GROW: a seedling, the root alone */
+                grow_start();
+                grow_next = fm1_ms + 8000u;     /* (the seedling's first leaf comes soon) */
+            }
         }
         if (lfo_tick(set.bpm, set.pul, set.shp, set.sea)) {   /* the season turned */
             set.scl = (uint8_t)scale_now;
             dirty = 1; t_change = fm1_ms; turn_ms = fm1_ms;
         }
+        grow_tick(set.den == DEN_GROW);
         cycle_tick(set.bpm, set.rat[eng_sel], set.stp[eng_sel], set.hit[eng_sel], set.rot[eng_sel], set.chc);
 
         midi_in();
@@ -1205,7 +1228,7 @@ static void app_main(void)
         fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
         snd = 0;                                /* STABS, BLOOM: the nodes of the voices sounding now */
         if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
-        if ((st = set.den | (uint32_t)drone_on << 4 | fl << 5 | snd << 6) != net_drawn) { net_drawn = st; draw_network(set.den, (uint32_t)drone_on, (int)fl, snd); }
+        if ((st = density | (uint32_t)drone_on << 4 | fl << 5 | snd << 6 | (uint32_t)(set.den == DEN_GROW) << 12) != net_drawn) { net_drawn = st; draw_network(density, (uint32_t)drone_on, (int)fl, snd, set.den == DEN_GROW); }
         if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
         st = page | cpu_pct << 3 | e8 << 12;    /* the panel: redrawn when the page, a value on it or the CPU changes */
         for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
