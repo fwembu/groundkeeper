@@ -24,13 +24,17 @@ static void app_idle(void);
 #endif
 
 /* ---- the sound (runs in the audio ISR: keep it short, no flash, no screen) */
-#define NV 4u                                   /* voices */
+#define NV 4u                                   /* the keys' voices: they bloom, in BLOOM's timbre and envelope */
 static struct {
     volatile uint32_t inc;                      /* phase step per frame: f * 2^32 / 44100 (unbent) */
-    volatile int32_t gate;                      /* target level, Q15: 0 = released */
-    int32_t amp;                                /* the level now: glides to gate, no clicks */
-    uint32_t ph, age;
-    uint8_t note;
+    volatile int32_t gate;                      /* 1: the key is held (main loop writes) */
+    volatile int32_t peak;                      /* how loud this bloom gets, Q15 (main loop writes, before trig) */
+    volatile uint32_t trig;                     /* +1 = bloom now (main loop writes) */
+    uint32_t tseen;                             /* (the last trig the audio saw) */
+    int32_t amp, nlp;                           /* the level now, Q15; MIST's breath */
+    uint32_t ph, pb, age;                       /* the two oscillators' phases */
+    uint8_t stage;                              /* 1 rising, else falling */
+    volatile uint8_t note, band;
 } voice[NV];
 static volatile uint32_t bend_q16 = 65536;      /* the pitch wheel: the steps times this / 65536 */
 
@@ -121,8 +125,6 @@ static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to
     wob_ph += 13710000u;                        /* WOBBLE: a wow at ~0.55 Hz and a slow random flutter */
     wob_fl += ((int32_t)(xs32(&aud_rng) >> 17) - 16384 - wob_fl) >> 4;
     wob = (int32_t)(((int64_t)((sine(wob_ph) * 21299 >> 15) + wob_fl) * (int32_t)wob_depth) >> 15);   /* Q16 */
-    if (tn == 1u || tp == 1u)
-        for (i = 0; i < n; i++) noise[i] = (int16_t)(xs32(&aud_rng) >> 16);
     for (v = 0; v < DV; v++) {
         uint32_t pa = drone[v].pa, pb = drone[v].pb, inc = drone[v].inc, tinc = drone[v].tinc, incm, incb, band = drone[v].band;
         int32_t breath, g, g0 = drone[v].glast, step, va = drone[v].vamp, va0 = va, mod;
@@ -165,6 +167,44 @@ static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to
         drone[v].pa = pa;
         drone[v].pb = pb;
     }
+}
+
+/* the keys (audio ISR): each a bloom in BLOOM's timbre, attack and release, as loud as one; it rises to its peak while
+ * the key is held, then falls (a key let go early falls at once). Into the bus: through FILTER and SPACE as the rest. */
+#define KEY_GAIN 6900                           /* a bloom's level (DRONE_GAIN, its breath on average, BLOOM's boost) */
+static volatile uint32_t key_tim = 4, key_att = 63, key_rel = 218;   /* (main loop writes) */
+static int keys_audio(int32_t *bus, uint32_t n)   /* adds the keys to bus; 1 if any sounds */
+{
+    uint32_t v, i, tn = key_tim, att = key_att, rel = key_rel;
+    int any = 0;
+    for (v = 0; v < NV; v++) {
+        uint32_t pa = voice[v].ph, pb = voice[v].pb, band = voice[v].band, inc, incb;
+        int32_t a0 = voice[v].amp, a = a0, g0, g1, step;
+        if (voice[v].trig != voice[v].tseen) { voice[v].tseen = voice[v].trig; voice[v].stage = 1; }
+        if (voice[v].stage && !voice[v].gate) voice[v].stage = 0;   /* let go while rising: fall from here */
+        if (voice[v].stage) {
+            a += (int32_t)att;
+            if (a >= voice[v].peak) { a = voice[v].peak; voice[v].stage = 0; }
+        } else a -= ((a * (int32_t)rel) >> 15) + 1;
+        if (a < 0) a = 0;
+        voice[v].amp = a;
+        if (!a && !a0) continue;                /* silent: costs nothing */
+        any = 1;
+        inc = (uint32_t)(((uint64_t)voice[v].inc * bend_q16) >> 16);
+        incb = inc + (inc >> DETUNE[tn]);
+        g0 = (((KEY_GAIN * (int32_t)TGAIN[tn]) >> 15) * a0) >> 15;
+        g1 = (((KEY_GAIN * (int32_t)TGAIN[tn]) >> 15) * a) >> 15;
+        step = (g1 - g0) / (int32_t)n;          /* (the gain ramps across the block: no clicks) */
+        for (i = 0; i < n; i++) {
+            pa += inc;
+            pb += incb;
+            g0 += step;
+            bus[i] += (shape(tn, pa, pb, band, &voice[v].nlp, noise[i]) * g0) >> 15;
+        }
+        voice[v].ph = pa;
+        voice[v].pb = pb;
+    }
+    return any;
 }
 
 /* ---- the sound around the drone (audio ISR): a resonant low-pass, then a reverb, then dry + wet out in stereo
@@ -308,31 +348,18 @@ static volatile uint32_t cpu_max_us;            /* the audio ISR's longest run s
 
 static void app_audio(int32_t *out, uint32_t n)
 {
-    uint32_t v, i;
+    uint32_t i;
+    int k;
 #ifndef DINGHY_HOST
     uint32_t t0 = fm1_ticks(), us;
 #endif
     if (n > BUS_N) n = BUS_N;
     for (i = 0; i < n; i++) bus[i] = 0;
+    if (tim_now == 1u || tim_prev == 1u || key_tim == 1u)   /* MIST breathes: a block of noise */
+        for (i = 0; i < n; i++) noise[i] = (int16_t)(xs32(&aud_rng) >> 16);
     drone_audio(bus, n);
-    fx_audio(bus, out, n, drone_lvl == 0);
-    for (v = 0; v < NV; v++) {
-        uint32_t ph = voice[v].ph, step = (uint32_t)(((uint64_t)voice[v].inc * bend_q16) >> 16);   /* (int64 multiply: fine) */
-        int32_t amp = voice[v].amp, g = voice[v].gate;
-        if (!amp && !g)
-            continue;                           /* silent: costs nothing */
-        for (i = 0; i < n; i++) {
-            int32_t s;
-            if (amp < g) { amp += 48; if (amp > g) amp = g; }        /* attack ~5 ms */
-            else if (amp > g) { amp -= 6; if (amp < g) amp = g; }    /* release ~45 ms */
-            ph += step;
-            s = (sine(ph) * amp) >> 15;
-            out[2u * i] += s;                   /* L */
-            out[2u * i + 1u] += s;              /* R */
-        }
-        voice[v].ph = ph;
-        voice[v].amp = amp;
-    }
+    k = keys_audio(bus, n);
+    fx_audio(bus, out, n, drone_lvl == 0 && !k);
 #ifndef DINGHY_HOST
     us = (fm1_ticks() - t0) / FM1_TICKS_PER_US;
     if (us > cpu_max_us) cpu_max_us = us;
@@ -355,9 +382,12 @@ static void play(uint32_t note, uint32_t vel)
         if (score < best) { best = score; pick = v; }
     }
     voice[pick].note = (uint8_t)note;
+    voice[pick].band = (uint8_t)(note < WT_BAND0 ? 0u : (note - WT_BAND0) / WT_BAND_STEP < WT_NBAND ? (note - WT_BAND0) / WT_BAND_STEP : WT_NBAND - 1u);
     voice[pick].age = ++ages;
     voice[pick].inc = INC_C9[note % 12u] >> (10u - note / 12u);
-    voice[pick].gate = (int32_t)(vel * 90u);    /* 127 -> 11430: four voices stay under full scale */
+    voice[pick].peak = (int32_t)(18000u + vel * 115u);   /* 127 -> ~32600: as loud as a bloom */
+    voice[pick].gate = 1;
+    voice[pick].trig++;                         /* (last: the audio sees the note and the peak with it) */
     last_note = note;
 }
 static void stop(uint32_t note)
@@ -771,6 +801,10 @@ static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "DENSITY", "PULSE", "SH
     "SPREAD", "PITCH", "CHORDS", "HISS", "TONE", "CRACKLE", "WOBBLE", "TEMPO", "SPELL", "TONIC", "SCALE", "MODE", "CHANCE",
     "TIMBRE", "TIMBRE", "ATTACK", "ATTACK", "ATTACK", "RELEASE", "RELEASE", "RELEASE", "STEPS", "STEPS", "HITS", "HITS",
     "ROTATE", "ROTATE", "RATE", "RATE", "CPU"};
+/* the keys: 0..23 play (F3..E5, in BLOOM's sound); the top three (F5, F#5, G5) are performance keys */
+#define KEY_PLAY 24u
+#define PK_UMWELT 26u                           /* G5, the top key: UMWELT while held (BLOOM's cycles wait) */
+static uint32_t um_hold, um_back;               /* the UMWELT key is held; the engine to go back to */
 /* the pages: HOME; EDIT 1, 2 (the engine's own: SEL picks the engine); LFO; FX 1, 2; the BOOK (GLO) */
 enum { P_HOME, P_ED1, P_ED2, P_LFO, P_FX1, P_FX2, P_BOOK, NPAGE };
 static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, STABS or BLOOM */
@@ -795,6 +829,9 @@ static void apply(void)                         /* the settings to the sound */
 {
     fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
     tim_now = set.tim[eng_sel];
+    key_tim = set.tim[1];                       /* the keys: BLOOM's timbre and envelope, whichever engine plays */
+    key_att = ATT_INC[set.att[2]];
+    key_rel = REL_K[set.rel[2]];
     um_mode = set.umd;
     engine = eng_sel || set.umd;                /* the audio: 0 hold (DRONE), 1 triggered (STABS, BLOOM) */
     trig_boost = eng_sel;
@@ -1094,7 +1131,9 @@ static void app_main(void)
         down = keys & ~prev;
         up = prev & ~keys;
         prev = keys;
-        for (k = 0; k < 27u; k++) {                 /* (a key stops the note it started: the octave may change meanwhile) */
+        if (down >> PK_UMWELT & 1u) { um_back = eng_sel; um_hold = 1; eng_sel = 0; apply(); }   /* held: UMWELT */
+        if (up >> PK_UMWELT & 1u && um_hold) { um_hold = 0; eng_sel = um_back; apply(); }        /* let go: back */
+        for (k = 0; k < KEY_PLAY; k++) {            /* (a key stops the note it started: the octave may change meanwhile) */
 #if BOARD_SMK37
             uint32_t vel = fm1_in.key_vel[SMK_KEY_F3 + k];   /* the SMK's keys feel the velocity */
 #else
@@ -1125,7 +1164,7 @@ static void app_main(void)
         b = fm1_input_edges(&rel);              /* buttons pressed since the last call (bit = button id) */
         if (b & (1u << BTN_OCT_DOWN) && oct > -2) { set.oct = (uint8_t)(oct - 1); dirty = 1; t_change = fm1_ms; }
         if (b & (1u << BTN_OCT_UP) && oct < 2) { set.oct = (uint8_t)(oct + 1); dirty = 1; t_change = fm1_ms; }
-        if (b & (1u << BTN_SEL)) { eng_sel ^= 1u; apply(); }               /* SEL: UMWELT <-> BLOOM */
+        if (b & (1u << BTN_SEL)) { if (um_hold) um_back ^= 1u; else { eng_sel ^= 1u; apply(); } }   /* SEL: UMWELT <-> BLOOM (the UMWELT key held: where it goes back to) */
         if (b & (1u << BTN_HOME)) page = P_HOME;                          /* HOME: back home */
         if (b & (1u << BTN_EDIT)) page = page == P_ED1 ? P_ED2 : P_ED1;   /* EDIT: the engine's pages */
         if (b & (1u << BTN_LFO)) page = page == P_LFO ? P_HOME : P_LFO;   /* LFO: tempo, pulse, season (again: home) */
@@ -1194,6 +1233,8 @@ static void app_main(void)
         for (k = 0; k < DV; k++)                /* the network's sounding notes light up too */
             if (drone[k].vamp > 2000 && drone[k].note >= base && drone[k].note < base + 27u)
                 lit |= 1u << (drone[k].note - base);
+        lit &= (1u << KEY_PLAY) - 1u;           /* the performance keys: lit while they act */
+        lit |= (uint32_t)um_hold << PK_UMWELT;
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
         fm1_led_key(BTN_SEL, !eng_sel);         /* lit: UMWELT */
