@@ -51,7 +51,7 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
  * DV voices, each two oscillators a few cents apart (a slow beat) in one of five timbres, with its own slow "breath".
  * The main loop sets a voice's target pitch; here the pitch glides there over a second or two.
  * Two ways to sound. Held (UMWELT DRONE): a voice that is part of the network grows in (ATTACK) and holds; one that is
- * not withers away (RELEASE). Triggered (UMWELT STABS, BLOOM): a voice sounds only when the main loop triggers it: it
+ * not withers away (RELEASE). Triggered (UMWELT EVENTS, BLOOM): a voice sounds only when the main loop triggers it: it
  * rises to its peak (ATTACK), then fades (RELEASE), and leaves silence until the next one. */
 #include "gk_tables.h"
 #define DV 6u                                   /* the most voices the network can grow (density 6) */
@@ -72,7 +72,7 @@ static struct {
 #define NT 5u                                   /* timbres: MOSS, MIST, CHOIR, ORGAN, REED */
 static volatile uint32_t tim_now;               /* the timbre (main loop writes) */
 static uint32_t tim_prev, tim_xf = 32767;       /* the crossfade from the last one, Q15 (audio) */
-static volatile uint32_t engine;                /* 0: voices hold (DRONE); 1: voices are triggered (STABS, BLOOM) */
+static volatile uint32_t engine;                /* 0: voices hold (DRONE); 1: voices are triggered (EVENTS, BLOOM) */
 static volatile uint32_t trig_boost;            /* BLOOM: each voice twice as loud (main loop writes) */
 static volatile uint32_t env_att = 63, env_rel = 218;   /* the envelope (ATT_INC, REL_K values; main loop writes) */
 static volatile uint32_t wob_depth;             /* WOBBLE: Q16 of the pitch (main loop writes) */
@@ -447,7 +447,7 @@ static int32_t spread = 8, pitch;               /* SPREAD 0..8 (8: the windows a
 static uint32_t chord_every = 5u;               /* CHORDS: pulses a chord (0: HOLD) */
 static uint32_t bloom_t[DV];                    /* BLOOM: when each voice last bloomed (fm1_ms) */
 static uint32_t eng_sel;                        /* 0 UMWELT, 1 BLOOM (SEL; UMWELT at every power-on) */
-static uint32_t um_mode;                        /* UMWELT: 0 DRONE, 1 STABS */
+static uint32_t um_mode;                        /* UMWELT: 0 DRONE, 1 EVENTS */
 static int homing;                              /* a new scale: at the next pulse, its home chord */
 
 static uint32_t rnd(uint32_t n)                 /* 0 .. n-1 (xorshift32) */
@@ -546,7 +546,12 @@ static void set_density(uint32_t d)             /* 1..6: voices grow in (planted
 }
 static uint32_t grow_next;                      /* GROW: when the network next grows or withers (fm1_ms) */
 static int32_t grow_dir = 1;                    /* GROW: +1 maturing, -1 withering */
-static void grow_wait(void) { grow_next = fm1_ms + 15000u + rnd(21u) * 1000u; }   /* a step every 15..35 s */
+static uint32_t grow_pace;                      /* GROW: the SEASON, in s (0: OFF) (main loop writes) */
+static void grow_wait(void)                     /* about a step a season (60..140 %, at least 4 s); SEASON OFF: 15..35 s */
+{
+    uint32_t w = grow_pace ? grow_pace * (600u + rnd(801u)) : 15000u + rnd(21u) * 1000u;
+    grow_next = fm1_ms + (w < 4000u ? 4000u : w);
+}
 static void grow_tick(int wild)                 /* GROW: now and then a voice grows in or withers, a life of minutes */
 {
     if (!wild || !drone_on || (int32_t)(fm1_ms - grow_next) < 0) return;
@@ -597,6 +602,13 @@ static void season_turn(void)                   /* the season moves the harmony:
     } else
         to = (scale_now + 1u + rnd(sp->n - 1u)) % sp->n;   /* any other of the spell's scales */
     cast(spell_now, tonic, to);
+}
+
+static int32_t roots_dir = 1;                   /* ROOTS: +1 sharpwards round the circle of fifths, -1 flatwards */
+static void roots_turn(void)                    /* ROOTS: the tonic a fifth along (mostly onward), the scale kept, pivoting */
+{
+    if (!rnd(3u)) roots_dir = -roots_dir;
+    cast(spell_now, (tonic + (roots_dir > 0 ? 1u : 11u)) % 12u, scale_now);
 }
 
 /* the sound events: a STAB (UMWELT, every living voice at once) or a BLOOM (one voice), on a hit of the cycle */
@@ -662,15 +674,15 @@ static void pulse_move(void)                    /* a pulse through the network: 
  * The CYCLE is the groove: STEPS steps of RATE (1/4 .. 1/32, triplets too), HITS of them spread as evenly as they go
  * (a Euclidean rhythm), turned by ROTATE; the first step is the accent. Each hit is a STAB or a BLOOM. */
 typedef struct { uint32_t ph; int32_t a, b; uint8_t seg, armed, zone; } lfo_t;   /* seg: log2 of random targets a cycle */
-static lfo_t pulse = {0, 0, 0, 2, 0, 0}, season = {0, 0, 0, 1, 0, 0};
+static lfo_t pulse = {0, 0, 0, 2, 0, 0}, season = {0, 0, 0, 1, 0, 0}, roots = {0, 0, 0, 1, 0, 0};
 static uint32_t lfo_t0;
 #define NPULSE 15u
 static const uint16_t PULSE_Q[NPULSE] = {0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256};   /* quarter beats; 0: STILL */
 static const char *const PULSE_LABEL[NPULSE] = {"STILL", "1/4", "1/2", "1", "2", "3", "4", "6", "8", "12", "16", "24", "32", "48", "64"};
 #define NSHAPE 3u
 static const char *const SHAPE_NAME[NSHAPE] = {"SINE", "MIX", "RANDOM"};
-#define NSEASON 41u                             /* OFF, then 15 s .. 10 min in 15 s steps */
-#define SEASON_S(i) ((uint32_t)(i) * 15u)
+#define NSEASON 57u                             /* OFF, then 5 s .. 2 min in 5 s steps, then 15 s steps to 10 min */
+#define SEASON_S(i) ((uint32_t)(i) <= 24u ? (uint32_t)(i) * 5u : 120u + ((uint32_t)(i) - 24u) * 15u)
 #define NRATE 6u
 static const uint8_t RATE_N[NRATE] = {1, 2, 3, 4, 6, 8};   /* cycle steps a beat */
 static const char *const RATE_LABEL[NRATE] = {"1/4", "1/8", "1/8T", "1/16", "16T", "1/32"};
@@ -691,14 +703,26 @@ static int32_t lfo_random(const lfo_t *l)       /* -32767..32767: from a to b al
 }
 static void lfo_reset(void)                     /* PLAY: both waves start from the middle */
 {
-    pulse.ph = season.ph = 0;
-    pulse.a = pulse.b = season.a = season.b = 0;
-    pulse.armed = season.zone = 0;
+    pulse.ph = season.ph = roots.ph = 0;
+    pulse.a = pulse.b = season.a = season.b = roots.a = roots.b = 0;
+    pulse.armed = season.zone = roots.zone = 0;
+    roots_dir = rnd(2u) ? 1 : -1;
     lfo_target(&pulse);
     season_dir = rnd(2u) ? 1 : -1;
     lfo_t0 = fm1_ms;
 }
-static int lfo_tick(uint32_t bpm, uint32_t pul, uint32_t shp, uint32_t sea)   /* returns 1 when the season turned */
+static int lfo_turn(lfo_t *l, uint32_t dt, uint32_t sea)   /* a season's slow random wave: 1 when it turns */
+{
+    int32_t v;
+    if (lfo_advance(l, dt, SEASON_S(sea) * 700u)) lfo_target(l);
+    if (!sea) return 0;
+    v = lfo_random(l);                          /* a turn: the wave swings well up or well down (back near the middle */
+    if (l->zone != 1u && v > 16384) { l->zone = 1; return 1; }   /*  before the same side turns it again) */
+    if (l->zone != 2u && v < -16384) { l->zone = 2; return 1; }
+    if ((l->zone == 1u && v < 8192) || (l->zone == 2u && v > -8192)) l->zone = 0;
+    return 0;
+}
+static int lfo_tick(uint32_t bpm, uint32_t pul, uint32_t shp, uint32_t sea, uint32_t roo)   /* 1: the season turned, 2: ROOTS */
 {
     uint32_t dt = fm1_ms - lfo_t0;
     int32_t v;
@@ -712,15 +736,8 @@ static int lfo_tick(uint32_t bpm, uint32_t pul, uint32_t shp, uint32_t sea)   /*
         if (v < -4000) pulse.armed = 1;         /* (below the middle first: one move per rise) */
         else if (v > 0 && pulse.armed) { pulse.armed = 0; pulse_move(); }
     }
-    if (lfo_advance(&season, dt, SEASON_S(sea) * 700u)) lfo_target(&season);
-    if (sea) {
-        int ev = 0;
-        v = lfo_random(&season);
-        if (season.zone != 1u && v > 16384) { season.zone = 1; ev = 1; }
-        else if (season.zone != 2u && v < -16384) { season.zone = 2; ev = 1; }
-        else if ((season.zone == 1u && v < 8192) || (season.zone == 2u && v > -8192)) season.zone = 0;
-        if (ev) { season_turn(); moved = 1; }
-    }
+    if (lfo_turn(&season, dt, sea)) { season_turn(); moved |= 1; }
+    if (lfo_turn(&roots, dt, roo)) { roots_turn(); moved |= 2; }
     return moved;
 }
 
@@ -774,7 +791,7 @@ static void grow_stop(void)                     /* PLAY again: the whole network
 }
 
 /* ---- the settings: one byte each, kept in flash; the F_ order is the struct's.
- * Each engine has its own timbre and cycle; DRONE, STABS and BLOOM each their own attack and release. The engine is
+ * Each engine has its own timbre and cycle; DRONE, EVENTS and BLOOM each their own attack and release. The engine is
  * not kept: every power-on starts in UMWELT. */
 #define NCHG 11u
 static const uint8_t CHG_N[NCHG] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16};   /* CHORDS: pulses a chord; 0: HOLD */
@@ -782,36 +799,37 @@ static const uint8_t CHG_N[NCHG] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16};   /* CH
 #define NREL 14u
 static struct {
     uint8_t oct, ch, den, pul, shp, sea, cut, res, spc, mix, spr, pit, chg, his, ton, crk, wob, bpm, spl, tnc, scl, umd, chc;
-    uint8_t tim[2], att[3], rel[3], stp[2], hit[2], rot[2], rat[2];
+    uint8_t tim[2], att[3], rel[3], stp[2], hit[2], rot[2], rat[2], roo;
 } set;
 enum { F_OCT, F_CH, F_DEN, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_SPR, F_PIT, F_CHG, F_HIS, F_TON, F_CRK, F_WOB,
        F_BPM, F_SPL, F_TNC, F_SCL, F_UMD, F_CHC, F_TIM, F_TIM1, F_ATT, F_ATT1, F_ATT2, F_REL, F_REL1, F_REL2,
-       F_STP, F_STP1, F_HIT, F_HIT1, F_ROT, F_ROT1, F_RAT, F_RAT1, F_N, F_CPU = F_N };
+       F_STP, F_STP1, F_HIT, F_HIT1, F_ROT, F_ROT1, F_RAT, F_RAT1, F_ROO, F_N, F_CPU = F_N };
 #define CFG ((uint8_t *)&set)
 static const uint8_t CFG_MIN[F_N] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0};
+    0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0};
 static const uint8_t CFG_MAX[F_N] = {255, 16, DEN_GROW, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u,
     NMIX - 1u, 8, 24, NCHG - 1u, 20, 10, 20, 10, 200, NSPELL - 1u, 11, 11, 1, 20, NT - 1u, NT - 1u, NATT - 1u, NATT - 1u,
-    NATT - 1u, NREL - 1u, NREL - 1u, NREL - 1u, 32, 32, 32, 32, 31, 31, NRATE - 1u, NRATE - 1u};
+    NATT - 1u, NREL - 1u, NREL - 1u, NREL - 1u, 32, 32, 32, 32, 31, 31, NRATE - 1u, NRATE - 1u, NSEASON - 1u};
 static const uint8_t CFG_DEF[F_N] = {0, 0, 4, 8, 1, 0, NCUT - 1u, 0, 8, 5, 8, 12, 5, 0, 5, 0, 0, 90, 0, 0, 0, 0, 20,
     0, 4,                                       /* timbre: UMWELT MOSS, BLOOM REED */
-    10, 1, 4,  10, 4, 8,                        /* attack, release: DRONE 3 s, 6 s; STABS 50 ms, 750 ms; BLOOM 350 ms, 3 s */
-    7, 9, 3, 4, 0, 0, 1, 1};                    /* cycles: UMWELT 3 in 7, BLOOM 4 in 9, in eighths */
+    10, 1, 4,  10, 4, 8,                        /* attack, release: DRONE 3 s, 6 s; EVENTS 50 ms, 750 ms; BLOOM 350 ms, 3 s */
+    7, 9, 3, 4, 0, 0, 1, 1,                     /* cycles: UMWELT 3 in 7, BLOOM 4 in 9, in eighths */
+    0};                                         /* ROOTS: OFF */
 static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "DENSITY", "PULSE", "SHAPE", "SEASON", "FILTER", "RES", "SPACE", "MIX",
     "SPREAD", "PITCH", "CHORDS", "HISS", "TONE", "CRACKLE", "WOBBLE", "TEMPO", "SPELL", "TONIC", "SCALE", "MODE", "CHANCE",
     "TIMBRE", "TIMBRE", "ATTACK", "ATTACK", "ATTACK", "RELEASE", "RELEASE", "RELEASE", "STEPS", "STEPS", "HITS", "HITS",
-    "ROTATE", "ROTATE", "RATE", "RATE", "CPU"};
+    "ROTATE", "ROTATE", "RATE", "RATE", "ROOTS", "CPU"};
 /* the keys: 0..23 play (F3..E5, in BLOOM's sound); the top three (F5, F#5, G5) are performance keys */
 #define KEY_PLAY 24u
 #define PK_UMWELT 26u                           /* G5, the top key: UMWELT while held (BLOOM's cycles wait) */
 static uint32_t um_hold, um_back;               /* the UMWELT key is held; the engine to go back to */
 /* the pages: HOME; EDIT 1, 2 (the engine's own: SEL picks the engine); LFO; FX 1, 2; the BOOK (GLO) */
 enum { P_HOME, P_ED1, P_ED2, P_LFO, P_FX1, P_FX2, P_BOOK, NPAGE };
-static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, STABS or BLOOM */
+static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, EVENTS or BLOOM */
 static uint32_t page_field(uint32_t page, uint32_t k)
 {
     static const uint8_t PF[NPAGE][4] = {{F_DEN, F_SPR, F_PIT, F_CHG}, {F_UMD, F_TIM, F_ATT, F_REL}, {F_STP, F_HIT, F_ROT, F_RAT},
-        {F_BPM, F_PUL, F_SHP, F_SEA}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}, {F_SPL, F_TNC, F_SCL, F_CPU}};
+        {F_BPM, F_PUL, F_SHP, F_SEA}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}, {F_SPL, F_TNC, F_SCL, F_ROO}};
     static const uint8_t BLOOM_ED1[4] = {F_TIM, F_ATT, F_REL, F_CHC};
     uint32_t f = page == P_ED1 && eng_sel ? BLOOM_ED1[k] : PF[page][k];
     if (f == F_ATT || f == F_REL) return f + env_ix();
@@ -829,11 +847,12 @@ static void apply(void)                         /* the settings to the sound */
 {
     fx_cut = set.cut; fx_res = set.res; fx_space = set.spc; fx_mix = set.mix;
     tim_now = set.tim[eng_sel];
+    grow_pace = SEASON_S(set.sea);
     key_tim = set.tim[1];                       /* the keys: BLOOM's timbre and envelope, whichever engine plays */
     key_att = ATT_INC[set.att[2]];
     key_rel = REL_K[set.rel[2]];
     um_mode = set.umd;
-    engine = eng_sel || set.umd;                /* the audio: 0 hold (DRONE), 1 triggered (STABS, BLOOM) */
+    engine = eng_sel || set.umd;                /* the audio: 0 hold (DRONE), 1 triggered (EVENTS, BLOOM) */
     trig_boost = eng_sel;
     env_att = ATT_INC[set.att[env_ix()]];
     env_rel = REL_K[set.rel[env_ix()]];
@@ -979,8 +998,8 @@ static void draw_network(uint32_t den, uint32_t on, int flash, uint32_t sounding
 static void draw_info(void)                     /* "WHEEL   UMWELT DRONE   MOSS" */
 {
     char s[44], *p = s;
-    put(&p, SPELL[spell_now].name); put(&p, "   ");
-    put(&p, eng_sel ? "BLOOM" : set.umd ? "UM STABS" : "UM DRONE"); put(&p, "   "); put(&p, TIM_NAME[set.tim[eng_sel]]);
+    put(&p, SPELL[spell_now].name); put(&p, "  ");
+    put(&p, eng_sel ? "BLOOM" : set.umd ? "UM EVENTS" : "UM DRONE"); put(&p, "  "); put(&p, TIM_NAME[set.tim[eng_sel]]);
     *p = 0;
     draw_text_box(0, 128, 240, &FONT_S, s, C_OFF, 1);
 }
@@ -999,13 +1018,13 @@ static void fmt_field(char **q, uint32_t f, uint32_t cpu)   /* a setting's value
     case F_PIT: if (v == 12u) put(q, "0"); else put_signed(q, (int32_t)v - 12); break;
     case F_DEN: if (v == DEN_GROW) put(q, "GROW"); else put_num(q, v); break;
     case F_CHG: if (CHG_N[v]) put_num(q, CHG_N[v]); else put(q, "HOLD"); break;
-    case F_UMD: put(q, v ? "STABS" : "DRONE"); break;
+    case F_UMD: put(q, v ? "EVENTS" : "DRONE"); break;
     case F_TIM: case F_TIM1: put(q, TIM_NAME[v]); break;
     case F_ATT: case F_ATT1: case F_ATT2: put(q, ATT_LABEL[v]); break;
     case F_REL: case F_REL1: case F_REL2: put(q, REL_LABEL[v]); break;
     case F_PUL: put(q, PULSE_LABEL[v]); break;
     case F_SHP: put(q, SHAPE_NAME[v]); break;
-    case F_SEA: fmt_season(q, v); break;
+    case F_SEA: case F_ROO: fmt_season(q, v); break;
     case F_CUT: put(q, CUT_LABEL[v]); break;
     case F_SPC: put(q, SPACE_LABEL[v]); break;
     case F_MIX: case F_CHC: put_num(q, v * 5u); *(*q)++ = '%'; break;
@@ -1095,7 +1114,7 @@ static void app_idle(void)
 static void app_main(void)
 {
     uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, scale_drawn = ~0u, info_drawn = ~0u, sigil_drawn = ~0u;
-    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, tabs_drawn = ~0u, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0;
+    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, tabs_drawn = ~0u, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0, cpu_drawn = 0;
 #ifndef DINGHY_HOST
     uint32_t cpu_t = 0;
 #endif
@@ -1215,8 +1234,9 @@ static void app_main(void)
                 grow_next = fm1_ms + 8000u;     /* (the seedling's first leaf comes soon) */
             }
         }
-        if (lfo_tick(set.bpm, set.pul, set.shp, set.sea)) {   /* the season turned */
+        if (lfo_tick(set.bpm, set.pul, set.shp, set.sea, set.roo)) {   /* the season or ROOTS turned */
             set.scl = (uint8_t)scale_now;
+            set.tnc = (uint8_t)tonic;
             dirty = 1; t_change = fm1_ms; turn_ms = fm1_ms;
         }
         grow_tick(set.den == DEN_GROW);
@@ -1267,7 +1287,7 @@ static void app_main(void)
         if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
         if ((st = drone_on ? 1000u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u : 0u) != note_drawn) { note_drawn = st; draw_note(); }
         fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
-        snd = 0;                                /* STABS, BLOOM: the nodes of the voices sounding now */
+        snd = 0;                                /* EVENTS, BLOOM: the nodes of the voices sounding now */
         if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
         if ((st = density | (uint32_t)drone_on << 4 | fl << 5 | snd << 6 | (uint32_t)(set.den == DEN_GROW) << 12) != net_drawn) { net_drawn = st; draw_network(density, (uint32_t)drone_on, (int)fl, snd, set.den == DEN_GROW); }
         if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
@@ -1275,6 +1295,13 @@ static void app_main(void)
         for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
         if (st != knobs_drawn) { knobs_drawn = st; draw_knobs(page, cpu_pct); }
         if (page != tabs_drawn) { tabs_drawn = page; draw_tabs(page); }
+        if ((st = page == P_BOOK ? 1000u + cpu_pct : 0u) != cpu_drawn) {   /* the BOOK: the CPU load, top right */
+            char c[12], *q = c;
+            cpu_drawn = st;
+            if (st) { put(&q, "CPU "); fmt_field(&q, F_CPU, cpu_pct); }
+            *q = 0;
+            draw_text_box(184, 4, 56, &FONT_S, c, C_OFF, 2);
+        }
         idle_ok = 0;
 
         if (dirty && quiet() && fm1_ms - t_change > 2000u) {   /* 2 s after the change, when silent (an erase stalls the sound) */
