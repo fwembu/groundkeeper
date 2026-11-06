@@ -5,7 +5,7 @@
  *
  *   keys       play sines, 4 voices; the notes go out over USB-MIDI too, on the MIDI channel
  *   OCT- OCT+  the octave (kept in flash)
- *   PRESETS    the MIDI channel: OMNI (in: all, out: 1) or 1..16 (kept in flash)
+ *   PRESETS    the spell's scale (F#5 held: CHORDS); the MIDI channel is kept in flash, tucked away for now
  *   MASTER     the volume (platform.c)
  *   MIDI in    notes from USB or the TRS jack play the sines, with their velocity; a MIDI clock shows its tempo
  *              and blinks PLAY on the beat, START / STOP light it
@@ -821,6 +821,7 @@ static const char *const F_NAME[F_N + 1] = {"OCT", "CH", "DENSITY", "PULSE", "SH
     "ROTATE", "ROTATE", "RATE", "RATE", "ROOTS", "CPU"};
 /* the keys: 0..23 play (F3..E5, in BLOOM's sound); the top three (F5, F#5, G5) are performance keys */
 #define KEY_PLAY 24u
+#define PK_ALT 25u                              /* F#5: while held, SELECT, PRESETS and ALGORITHM turn something else */
 #define PK_UMWELT 26u                           /* G5, the top key: UMWELT while held (BLOOM's cycles wait) */
 static uint32_t um_hold, um_back;               /* the UMWELT key is held; the engine to go back to */
 /* the pages: HOME; EDIT 1, 2 (the engine's own: SEL picks the engine); LFO; FX 1, 2; the BOOK (GLO) */
@@ -828,7 +829,7 @@ enum { P_HOME, P_ED1, P_ED2, P_LFO, P_FX1, P_FX2, P_BOOK, NPAGE };
 static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, EVENTS or BLOOM */
 static uint32_t page_field(uint32_t page, uint32_t k)
 {
-    static const uint8_t PF[NPAGE][4] = {{F_DEN, F_SPR, F_PIT, F_CHG}, {F_UMD, F_TIM, F_ATT, F_REL}, {F_STP, F_HIT, F_ROT, F_RAT},
+    static const uint8_t PF[NPAGE][4] = {{F_SPR, F_PIT, F_PUL, F_UMD},   /* (HOME's KNOB 4 is the engine: engine_turn) */ {F_UMD, F_TIM, F_ATT, F_REL}, {F_STP, F_HIT, F_ROT, F_RAT},
         {F_BPM, F_PUL, F_SHP, F_SEA}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB}, {F_SPL, F_TNC, F_SCL, F_ROO}};
     static const uint8_t BLOOM_ED1[4] = {F_TIM, F_ATT, F_REL, F_CHC};
     uint32_t f = page == P_ED1 && eng_sel ? BLOOM_ED1[k] : PF[page][k];
@@ -1077,6 +1078,398 @@ static void draw_tabs(uint32_t page)            /* the bottom line: the pages, t
     cv_blit(0, 214);
 }
 
+/* ---- HOME: a living page. The spell's sigil, large and gently alive; a new spell crumbles it to seeds that fall to
+ * the soil and grow the next one. Below it the network, as mycelium in the ground: DENSITY the nodes grown, SPREAD
+ * how far its threads reach, PITCH how deep it lies (above the soil: high). A node shines as its voice sounds; a pulse
+ * runs out along the threads. Words only for a moment: what was just turned, or the scale after the season turns. */
+#define SG_X 40u                                /* the sigil: 160 x 128 at (40, 20) */
+#define SG_Y 20u
+#define SG_W 160
+#define SG_H 128
+#define SG_CX 80
+#define SG_CY 62
+#define MY_Y 150u                               /* the ground: 240 x 66 at (0, 150) */
+#define MY_H 64
+#define MY_SOIL 22                              /* the soil line in it */
+#define T_OUT 700u                              /* a new spell: the old one crumbles, its seeds rest, the new one grows */
+#define T_REST 250u
+#define T_IN 1100u
+#define T_MOVE 450u                             /* a new scale: the light moves along the figure */
+#define F_ENG F_N                               /* (HOME, KNOB 4: DRONE, EVENTS, BLOOM; not a setting of its own) */
+
+static uint16_t lite(int32_t l)                 /* a light: 0 dark .. 160 moss .. 255 pale green */
+{
+    int32_t r, g, b;
+    if (l <= 0) return C_BLACK;
+    if (l > 255) l = 255;
+    if (l < 160) { r = 120 * l / 160; g = 170 * l / 160; b = 90 * l / 160; }
+    else { l -= 160; r = 120 + 70 * l / 95; g = 170 + 65 * l / 95; b = 90 + 60 * l / 95; }
+    return RGB(r, g, b);
+}
+static uint32_t hsh(uint32_t x) { x *= 0x9E3779B1u; x ^= x >> 15; x *= 0x85EBCA6Bu; x ^= x >> 13; return x; }
+static int32_t ease(int32_t k) { return k <= 0 ? 0 : k >= 256 ? 256 : (k * k * (768 - 2 * k)) >> 16; }   /* 0..256, smooth */
+static uint32_t per(uint32_t t, uint32_t ms) { return t * (4294967295u / ms); }   /* a phase that turns once every ms */
+
+/* the sigil's pen: everything may be crumbling (dithered away) or growing up from the soil */
+static uint32_t sg_mode, sg_amt;                /* 0 whole; 1 crumbling, sg_amt 0..256 gone; 2 growing, 0..320 grown */
+static int sg_on(int32_t x, int32_t y)
+{
+    uint32_t h, d;
+    if (!sg_mode) return 1;
+    h = hsh((uint32_t)(x * 977 + y * 131)) & 255u;
+    if (sg_mode == 1u) return h >= sg_amt;
+    d = (uint32_t)((x - SG_CX) * (x - SG_CX) + (y - SG_H) * (y - SG_H)) * 256u / 23000u;   /* from the soil, below the middle */
+    return d + (h >> 2) < sg_amt;
+}
+static void sg_pset(int32_t x, int32_t y, uint16_t c) { if (sg_on(x, y)) cv_pset(x, y, c); }
+static void sg_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint16_t c)
+{
+    int32_t dx = x1 > x0 ? x1 - x0 : x0 - x1, sx_ = x0 < x1 ? 1 : -1, dy = y1 > y0 ? y0 - y1 : y1 - y0, sy_ = y0 < y1 ? 1 : -1;
+    int32_t err = dx + dy, guard = 600;
+    while (guard--) {
+        int32_t e2 = 2 * err;
+        sg_pset(x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        if (e2 >= dy) { err += dy; x0 += sx_; }
+        if (e2 <= dx) { err += dx; y0 += sy_; }
+    }
+}
+static void sg_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c, int round)   /* filled; round: corners off */
+{
+    int32_t i, j;
+    for (j = 0; j < h; j++)
+        for (i = 0; i < w; i++)
+            if (!round || !((i == 0 || i == w - 1) && (j == 0 || j == h - 1))) sg_pset(x + i, y + j, c);
+}
+static void sg_ell(int32_t cx, int32_t cy, int32_t rx, int32_t ry, uint32_t segs, uint32_t rot, int dots, uint16_t c)
+{
+    uint32_t i, st = 4294967295u / segs;
+    for (i = 0; i < segs; i++) {
+        uint32_t a = rot + i * st, b = a + st;
+        if (!dots || !(i & 1u)) sg_line(cx + sx(a, rx), cy + sy(a, ry), cx + sx(b, rx), cy + sy(b, ry), c);
+    }
+}
+static int32_t water(int32_t x, uint32_t line, uint32_t t)   /* STILLWATER: a line's slow swell at x */
+{
+    return sine((uint32_t)x * 0x03800000u + line * 0x40000000u + per(t, 7000u) * (line == 1u ? 1u : 2u)) * 4 >> 15;
+}
+
+static void sg_points(uint32_t sp, uint32_t t, int32_t *px, int32_t *py)   /* where each of the spell's scales sits now */
+{
+    const uint32_t n = SPELL[sp].n, Q = 0x40000000u;
+    uint32_t i, a;
+    for (i = 0; i < n; i++)
+        switch (sp) {
+        case 0: a = i * (4294967295u / 12u) - Q; px[i] = SG_CX + sx(a, 54); py[i] = SG_CY + sy(a, 54); break;
+        case 1: px[i] = 20 + (int32_t)i * 24; py[i] = SG_CY + water(px[i], 1u, t); break;
+        case 2: a = 0x0E38E38Eu + i * (0x638E38E3u / (n - 1u)); px[i] = SG_CX + sx(a, 56); py[i] = 48 + sy(a, 56); break;
+        case 3: a = i * Q + Q / 2u; px[i] = SG_CX + sx(a, 52); py[i] = SG_CY + sy(a, 52); break;
+        case 4:                                 /* the caps bob, one after another */
+            a = i * (4294967295u / 6u) - Q;
+            px[i] = SG_CX + sx(a, 48); py[i] = SG_CY + 2 + sy(a, 48) + (sine(per(t, 2600u) + i * 0x2AAAAAAAu) * 3 >> 16);
+            break;
+        default: px[i] = SG_CX; py[i] = 112 - (int32_t)i * 26; break;
+        }
+}
+static void slot(uint32_t i, uint32_t n, int32_t *x, int32_t *y)   /* a seed resting in the soil */
+{
+    *x = SG_CX + ((int32_t)(2u * i) - (int32_t)(n - 1u)) * 6;
+    *y = SG_H - 5;
+}
+/* the figure, and the light on the scale now: lit 0..256 of the way from scale `from` to `cur`; hi its brightness */
+static void sg_figure(uint32_t sp, uint32_t t, uint32_t cur, uint32_t from, int32_t lit, int32_t hi, int marks)
+{
+    const uint32_t n = SPELL[sp].n, Q = 0x40000000u;
+    int32_t px[12], py[12], i, mx, my, fx, fy;
+    uint16_t faint = lite(64), dim = lite(96);
+    sg_points(sp, t, px, py);
+    mx = px[from] + (px[cur] - px[from]) * lit / 256;   /* the light, on its way */
+    my = py[from] + (py[cur] - py[from]) * lit / 256;
+    switch (sp) {
+    case 0: {                                   /* WHEEL: a glint runs round the rim; the hand turns to the key */
+        uint32_t g = per(t, 26000u), seg = 4294967295u / 72u, a0, a1, ah;
+        int32_t d;
+        for (i = 0; i < 72; i++) {
+            uint32_t a = (uint32_t)i * seg, off = a - g;
+            int32_t near = (int32_t)(off < 0x80000000u ? off : 0u - off) >> 24;   /* how far from the glint, 0..128 */
+            sg_line(SG_CX + sx(a, 54), SG_CY + sy(a, 54), SG_CX + sx(a + seg, 54), SG_CY + sy(a + seg, 54),
+                    lite(near < 12 ? 64 + (12 - near) * 8 : 64));
+        }
+        sg_ell(SG_CX, SG_CY, 5, 5, 16u, 0u, 0, faint);
+        for (i = 0; i < 12; i++) {
+            uint32_t a = (uint32_t)i * (4294967295u / 12u) - Q;
+            sg_line(SG_CX + sx(a, 45), SG_CY + sy(a, 45), SG_CX + sx(a, 51), SG_CY + sy(a, 51), faint);
+        }
+        a0 = from * (4294967295u / 12u); a1 = cur * (4294967295u / 12u);   /* the hand: the short way round */
+        d = (int32_t)(a1 - a0);
+        ah = a0 + (uint32_t)(d >> 8) * (uint32_t)lit - Q + (uint32_t)(sine(per(t, 5300u)) * 512);   /* (and it sways a breath) */
+        mx = SG_CX + sx(ah, 54); my = SG_CY + sy(ah, 54);
+        fx = SG_CX + sx(ah, 7); fy = SG_CY + sy(ah, 7);
+        sg_line(fx, fy, SG_CX + sx(ah, 44), SG_CY + sy(ah, 44), lite(hi));
+        sg_line(fx + 1, fy, SG_CX + sx(ah, 44) + 1, SG_CY + sy(ah, 44), lite(hi));
+        break;
+    }
+    case 1: {                                   /* STILLWATER: three lines swell; rings spread from the scale now */
+        uint32_t ln, r = t % 3600u;
+        for (ln = 0; ln < 3u; ln++) {
+            int32_t x, y0 = SG_CY - 26 + (int32_t)ln * 26, prev = y0 + water(6, ln, t);
+            for (x = 7; x < 154; x++) {
+                int32_t y = y0 + water(x, ln, t);
+                sg_line(x - 1, prev, x, y, ln == 1u ? lite(130) : faint);
+                prev = y;
+            }
+        }
+        if (r > 200u && marks) {
+            int32_t rr = (int32_t)(r * 30u / 3600u);
+            sg_ell(mx, my, rr, rr / 3 + 1, 24u, 0u, 0, lite(150 - rr * 4));
+        }
+        break;
+    }
+    case 2: {                                   /* HOLLOW: a bowl under a dark moon; its shadow drifts, the bowl's water rocks */
+        int32_t dr = sine(per(t, 15000u)) * 6 >> 15, tl = sine(per(t, 6100u)) * 3 >> 15;
+        sg_ell(SG_CX, 24, 16, 16, 32u, 0u, 0, lite(62));
+        sg_ell(SG_CX + 6 + dr, 21, 14, 14, 32u, 0u, 1, lite(38));
+        for (i = 0; i < 28; i++) {
+            uint32_t a = 0x0E38E38Eu + (uint32_t)i * (0x638E38E3u / 28u), b = a + 0x638E38E3u / 28u;
+            sg_line(SG_CX + sx(a, 56), 48 + sy(a, 56), SG_CX + sx(b, 56), 48 + sy(b, 56), faint);
+        }
+        sg_line(SG_CX - 38, 86 + tl, SG_CX + 38, 86 - tl, lite(40));
+        break;
+    }
+    case 3: {                                   /* MEADOW: a sun; its rays turn slowly and breathe */
+        uint32_t rot = per(t, 90000u);
+        sg_ell(SG_CX, SG_CY, 14, 14, 32u, 0u, 0, lite(150));
+        sg_ell(SG_CX, SG_CY, 13, 13, 32u, 0u, 0, lite(150));
+        for (i = 0; i < 8; i++) {
+            uint32_t a = rot + (uint32_t)i * (Q / 2u);
+            int32_t len = (i & 1 ? 30 : 40) + (sine(per(t, 4700u) + (uint32_t)i * 0x20000000u) * 3 >> 15);
+            sg_line(SG_CX + sx(a, 20), SG_CY + sy(a, 20), SG_CX + sx(a, len), SG_CY + sy(a, len), faint);
+        }
+        break;
+    }
+    case 4: {                                   /* FAE RING: the ring's dots wander round; spores rise and fade */
+        sg_ell(SG_CX, SG_CY + 2, 48, 48, 64u, per(t, 60000u), 1, faint);
+        for (i = 0; i < (int32_t)n; i++) {
+            uint32_t ph = (t + (uint32_t)i * 1913u) % 5200u;
+            int32_t amt = i == (int32_t)cur ? lit : i == (int32_t)from ? 256 - lit : 0;
+            uint16_t c = lite(110 + (hi - 110) * amt / 256);
+            sg_line(px[i], py[i] + 2, px[i], py[i] + 9, faint);
+            sg_rect(px[i] - 5, py[i] - 1, 11, 3, c, 1);
+            sg_rect(px[i] - 3, py[i] - 3, 7, 2, c, 0);
+            if (ph < 3000u)
+                sg_pset(px[i] + (sine(ph * 1431655u) * 3 >> 15), py[i] - 6 - (int32_t)(ph * 22u / 3000u), lite(130 - (int32_t)(ph * 120u / 3000u)));
+        }
+        return;
+    }
+    default: {                                  /* OLD SONG: a cairn; a slow light climbs it */
+        int32_t climb = (int32_t)(t % 9000u) * ((int32_t)n + 2) * 256 / 9000 - 256;
+        for (i = 0; i < (int32_t)n; i++) {
+            int32_t w = 92 - i * 18, amt = i == (int32_t)cur ? lit : i == (int32_t)from ? 256 - lit : 0;
+            int32_t d = climb - i * 256, bump = d < 0 ? -d : d, base = 46 + (bump < 256 ? (256 - bump) * 24 / 256 : 0);
+            sg_rect(SG_CX - w / 2, py[i] - 9, w, 18, lite(base + (hi * 3 / 4 - base) * amt / 256), 1);   /* (lit: softer, it is big)*/
+        }
+        return;
+    }
+    }
+    if (!marks) return;
+    for (i = 0; i < (int32_t)n; i++) sg_rect(px[i] - 1, py[i] - 1, 3, 3, dim, 0);   /* the scales: seeds; the one now lit */
+    sg_rect(mx - 3, my - 3, 7, 7, lite(hi), 1);
+}
+
+static struct { uint32_t sp, cur, osp, ocur, tsp, tcur; } sg = {99u, 0, 0, 0, 0, 0};
+static void draw_home_sigil(uint32_t now, int glow)
+{
+    int32_t hi = glow ? 250 : 178 + (sine(per(now, 4300u)) * 16 >> 15), lit = 256, px[12], py[12], x, y, half;
+    uint32_t ds, i, n;
+    if (sg.sp == 99u) { sg.sp = spell_now; sg.cur = sg.ocur = scale_now; sg.tsp = now - 10000u; sg.tcur = now - 10000u; }
+    if (spell_now != sg.sp) { sg.osp = sg.sp; sg.ocur = sg.cur; sg.sp = spell_now; sg.cur = scale_now; sg.tsp = now; sg.tcur = now - 10000u; }
+    else if (scale_now != sg.cur) { sg.ocur = sg.cur; sg.cur = scale_now; sg.tcur = now; }
+    for (half = 0; half < 2; half++) {          /* (the canvas holds 64 rows: the top half, then the bottom) */
+    cv_begin(SG_W, SG_H / 2, C_BLACK);
+    cv_oy = -half * (SG_H / 2);
+    ds = now - sg.tsp;
+    if (ds < T_OUT) {                           /* the old figure crumbles; its seeds fall to the soil */
+        n = SPELL[sg.osp].n;
+        sg_mode = 1u; sg_amt = ds * 256u / T_OUT;
+        sg_figure(sg.osp, now, sg.ocur, sg.ocur, 256, hi, 0);
+        sg_mode = 0u;
+        sg_points(sg.osp, now, px, py);
+        for (i = 0; i < n; i++) {
+            int32_t k = ease((int32_t)(ds * 256u / T_OUT)), kk = k * k / 256;   /* (falling: slow, then faster) */
+            slot(i, n, &x, &y);
+            x = px[i] + (x - px[i]) * k / 256; y = py[i] + (y - py[i]) * kk / 256;
+            sg_rect(x - 1, y - 1, 3, 3, lite(i == sg.ocur ? hi : 120), 0);
+        }
+    } else if (ds < T_OUT + T_REST) {           /* seeds at rest */
+        n = SPELL[sg.osp].n;
+        for (i = 0; i < n; i++) { slot(i, n, &x, &y); sg_rect(x - 1, y - 1, 3, 3, lite(120), 0); }
+    } else if (ds < T_OUT + T_REST + T_IN) {    /* the new one grows up from the soil; its seeds rise into place */
+        uint32_t u = ds - T_OUT - T_REST;
+        n = SPELL[sg.sp].n;
+        sg_mode = 2u; sg_amt = u * 320u / T_IN;
+        sg_figure(sg.sp, now, sg.cur, sg.cur, 256, hi, 0);
+        sg_mode = 0u;
+        sg_points(sg.sp, now, px, py);
+        for (i = 0; i < n; i++) {
+            int32_t k = ease((int32_t)(u * 256u / (T_IN * 3u / 4u)) - (int32_t)(i * 64u / n));
+            slot(i, n, &x, &y);
+            x += (px[i] - x) * k / 256; y += (py[i] - y) * k / 256;
+            sg_rect(x - 1, y - 1, 3, 3, lite(i == sg.cur ? 120 + (hi - 120) * k / 256 : 120), 0);
+        }
+    } else {
+        if (now - sg.tcur < T_MOVE) lit = ease((int32_t)((now - sg.tcur) * 256u / T_MOVE));
+        sg_figure(sg.sp, now, sg.cur, lit < 256 ? sg.ocur : sg.cur, lit, hi, 1);
+    }
+    cv_blit(SG_X, SG_Y + (uint32_t)half * (SG_H / 2));
+    }
+    cv_oy = 0;
+}
+
+/* the mycelium: nodes in RANK order (the root, then out to either side), each on a thread from its parent */
+static const int8_t MY_DX[DV] = {0, 40, -44, 78, -84, 108}, MY_DY[DV] = {0, -6, 5, 8, -7, -3};
+static const uint8_t MY_PAR[DV] = {0, 0, 0, 1, 2, 3}, MY_DEPTH[DV] = {0, 1, 1, 2, 2, 3};
+#define MY_SEG 10
+static int32_t my_spr = 256, my_pit = 12 << 8, my_g[DV];   /* eased: the reach (/256), the pitch (x256), each node's growth */
+static uint32_t my_t;
+static void my_node(uint32_t r, uint32_t t, int32_t *x, int32_t *y)
+{
+    int32_t yc = 34 - ((my_pit - (12 << 8)) >> 7);   /* PITCH 0: just under the soil; +12 above it, -12 deep */
+    *x = 120 + MY_DX[r] * my_spr / 256;
+    *y = yc + MY_DY[r] * (my_spr + 256) / 512 + (r ? sine(per(t, 6000u + r * 700u)) * 1 >> 15 : 0);
+}
+static void my_thread_pt(uint32_t r, uint32_t j, uint32_t t, int32_t *x, int32_t *y)   /* point j of node r's thread */
+{
+    int32_t x0, y0, x1, y1;
+    my_node(MY_PAR[r], t, &x0, &y0);
+    my_node(r, t, &x1, &y1);
+    *x = x0 + (x1 - x0) * (int32_t)j / MY_SEG;
+    *y = y0 + (y1 - y0) * (int32_t)j / MY_SEG;
+    if (j && j < MY_SEG) {                      /* a gentle bow, a slow wave along it, breathing */
+        uint32_t h = hsh(r * 31u + 7u);
+        *y += (sine(j * (0x80000000u / MY_SEG)) * ((int32_t)(h % 11u) - 5) >> 15)
+            + (sine(j * 0x2C000000u + h + per(t, 4100u + r * 300u)) * 2 >> 15);
+    }
+}
+static void draw_mycelium(uint32_t now, int grow_mode)
+{
+    uint32_t r, j, dt = now - my_t;
+    int32_t x, y, px_, py_, spr_t = 40 + (int32_t)set.spr * 27, pit_t = (int32_t)set.pit << 8;
+    uint16_t thr = lite(90), hair = lite(44), seed = grow_mode ? lite(70) : RGB(55, 55, 55);
+    int fl = drone_on && pulse_ms && now - pulse_ms < 900u;
+    my_t = now;
+    if (dt > 200u) dt = 200u;
+    my_spr += (spr_t - my_spr) * (int32_t)dt / 300 + (spr_t > my_spr) - (spr_t < my_spr);   /* SPREAD and PITCH glide */
+    my_pit += (pit_t - my_pit) * (int32_t)dt / 300 + (pit_t > my_pit) - (pit_t < my_pit);
+    for (r = 0; r < DV; r++) {                  /* each node grows in over ~2.5 s, withers over ~3.5 s */
+        int32_t want = drone_on && r < density ? 256 : 0;
+        if (my_g[r] < want) { my_g[r] += (int32_t)dt * 256 / 2500 + 1; if (my_g[r] > want) my_g[r] = want; }
+        else if (my_g[r] > want) { my_g[r] -= (int32_t)dt * 256 / 3500 + 1; if (my_g[r] < want) my_g[r] = want; }
+    }
+    cv_begin(240, MY_H, C_BLACK);
+    for (j = 0; j < 46u; j++) {                 /* the earth: a few still specks; the soil line */
+        uint32_t h = hsh(j + 77u);
+        cv_pset((int32_t)(h % 240u), MY_SOIL + 4 + (int32_t)((h >> 8) % (uint32_t)(MY_H - MY_SOIL - 5)), lite(26));
+    }
+    for (x = 1; x < 240; x += 3) cv_pset(x, MY_SOIL, lite(40));
+    if (my_g[0]) {                              /* the root's rootlets */
+        my_node(0, now, &x, &y);
+        for (j = 0; j < 3u; j++) {
+            int32_t len = 5 + (int32_t)((hsh(j + 5u) % 6u) * (uint32_t)my_g[0] / 256u);
+            cv_line(x, y, x - 4 + (int32_t)j * 4, y + len, hair);
+        }
+    }
+    for (r = 1; r < DV; r++) {                  /* the threads, as far as they have grown, and their hairs */
+        uint32_t reach = (uint32_t)my_g[r] * MY_SEG;
+        if (!my_g[r]) continue;
+        my_thread_pt(r, 0, now, &px_, &py_);
+        for (j = 1; j <= MY_SEG && (j - 1u) * 256u < reach; j++) {
+            my_thread_pt(r, j, now, &x, &y);
+            if (j * 256u > reach) { int32_t f = (int32_t)(reach - (j - 1u) * 256u); x = px_ + (x - px_) * f / 256; y = py_ + (y - py_) * f / 256; }
+            cv_line(px_, py_, x, y, fl ? lite(120) : thr);
+            if (j < MY_SEG && j * 256u <= reach && (hsh(r * 97u + j) & 3u) < 2u) {   /* hairs, some forked */
+                uint32_t h = hsh(r * 53u + j);
+                int32_t hx = x + (int32_t)(h % 9u) - 4, hy = y + ((h >> 4) & 1u ? -4 : 5) + (int32_t)((h >> 5) % 3u);
+                cv_line(x, y, hx, hy, hair);
+                if ((h >> 8) & 1u) cv_line(hx, hy, hx + ((h >> 9) & 1u ? 3 : -3), hy + (hy < y ? -2 : 3), hair);
+            }
+            px_ = x; py_ = y;
+        }
+    }
+    if (fl) {                                   /* a pulse: a bead runs out from the root, thread by thread */
+        int32_t u = (int32_t)(now - pulse_ms) * 256 / 300;
+        for (r = 1; r < DV; r++) {
+            int32_t k = u - (int32_t)(MY_DEPTH[r] - 1u) * 256;
+            if (k < 0 || k >= 256 || my_g[r] < 256) continue;
+            my_thread_pt(r, (uint32_t)k * MY_SEG / 256u, now, &x, &y);
+            cv_rect(x - 1, y - 1, 3, 3, lite(235));
+        }
+    }
+    for (r = 0; r < DV; r++) {                  /* the nodes: a seed where one may grow; a grown one shines as its voice sounds */
+        my_node(r, now, &x, &y);
+        if (my_g[r] < 96) { cv_rect(x - 1, y - 1, 2, 2, seed); continue; }
+        {
+            int32_t a = drone[RANK[r]].vamp, l = 100 + (a > 0 ? a : 0) * 155 / 32767, s = my_g[r] < 256 ? 1 : 2;   /* (RANK is its own inverse) */
+            cv_rect(x - s, y - s - 1, 2 * s + 1, 2 * s + 3, lite(l));
+            cv_rect(x - s - 1, y - s, 2 * s + 3, 2 * s + 1, lite(l));
+        }
+    }
+    cv_blit(0, MY_Y);
+}
+
+/* words for a moment */
+static char say_s[34];
+static uint32_t say_t, say_v;
+static void say(const char *s)
+{
+    uint32_t i = 0;
+    while (s[i] && i < sizeof say_s - 1u) { say_s[i] = s[i]; i++; }
+    say_s[i] = 0;
+    say_t = fm1_ms; say_v++;
+}
+static void say_field(uint32_t f)
+{
+    char s[34], *q = s;
+    if (f == F_ENG) put(&q, eng_sel ? "BLOOM" : set.umd ? "EVENTS" : "DRONE");
+    else { put(&q, F_NAME[f]); *q++ = ' '; fmt_field(&q, f, 0); }
+    *q = 0;
+    say(s);
+}
+static void say_scale(void)
+{
+    char s[24], *p = s;
+    put(&p, PC_NAME[scale_pc[0]]); *p++ = ' '; put(&p, MODE_NAME[SPELL[spell_now].mode[scale_now]]);
+    *p = 0;
+    say(s);
+}
+
+/* turning things */
+static int field_turn(uint32_t f, int32_t e)    /* a setting turned e detents; 1: the spell, tonic or scale changed */
+{
+    int32_t d = (int32_t)CFG[f] + e;
+    CFG[f] = (uint8_t)(d < (int32_t)CFG_MIN[f] ? (int32_t)CFG_MIN[f] : d > (int32_t)cfg_max(f) ? (int32_t)cfg_max(f) : d);
+    if (f == F_STP || f == F_STP1) {            /* fewer steps: hits and rotation stay inside */
+        uint32_t i = f - F_STP;
+        if (set.hit[i] > set.stp[i]) set.hit[i] = set.stp[i];
+        if (set.rot[i] >= set.stp[i]) set.rot[i] = (uint8_t)(set.stp[i] - 1u);
+    }
+    if (f == F_SPL) set.scl = 0;                /* a new spell: from its first scale */
+    if (f == F_SPL || f == F_TNC || f == F_SCL) cast(set.spl, set.tnc, set.scl);
+    apply();
+    if (f == F_DEN && set.den == DEN_GROW) { grow_dir = density >= DV ? -1 : 1; grow_wait(); }   /* GROW: on from here */
+    else if (f == F_DEN) set_density(set.den);
+    if (f == F_SPR || f == F_PIT) revoice();
+    return f == F_SPL || f == F_TNC || f == F_SCL;
+}
+static void engine_turn(int32_t e, uint32_t um_held, uint32_t *um_ret)   /* HOME KNOB 4: DRONE, EVENTS, BLOOM */
+{
+    int32_t ei = (int32_t)((um_held ? *um_ret : eng_sel) ? 2u : set.umd) + e;
+    ei = ei < 0 ? 0 : ei > 2 ? 2 : ei;
+    if (ei < 2) set.umd = (uint8_t)ei;
+    if (um_held) *um_ret = ei == 2;             /* (the UMWELT key held: where it goes back to) */
+    else eng_sel = ei == 2;
+    apply();
+}
+
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
 static uint32_t idle_ok, midi_src, clk_n, clk_t0, clk_bpm, clk_run, clk_beat_ms;
 
@@ -1106,15 +1499,17 @@ static void midi_in(void)
         else if (ty == 0x80u || ty == 0x90u) stop(d1);
     }
 }
-static void app_idle(void)
+static void app_idle(void)                      /* while the screen draws: MIDI in, and the cycle keeps its time */
 {
-    if (idle_ok) midi_in();
+    if (!idle_ok) return;
+    midi_in();
+    cycle_tick(set.bpm, set.rat[eng_sel], set.stp[eng_sel], set.hit[eng_sel], set.rot[eng_sel], set.chc);
 }
 
 static void app_main(void)
 {
     uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, scale_drawn = ~0u, info_drawn = ~0u, sigil_drawn = ~0u;
-    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, tabs_drawn = ~0u, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0, cpu_drawn = 0;
+    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, tabs_drawn = ~0u, chord_drawn = ~0u, label_drawn = ~0u, shown = NPAGE, sg_drawn_t = 0, my_drawn_t = 0, home_turn = 0, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0, cpu_drawn = 0;
 #ifndef DINGHY_HOST
     uint32_t cpu_t = 0;
 #endif
@@ -1141,7 +1536,7 @@ static void app_main(void)
     draw_text_box(0, 4, 240, &FONT_S, APP_NAME, C_ACC, 1);
 
     for (;;) {
-        uint32_t keys, down, up, rel, b, lit = 0, out_ch = set.ch ? set.ch - 1u : 0u, st, e8 = eng_sel;
+        uint32_t keys, down, up, rel, b, lit = 0, out_ch = set.ch ? set.ch - 1u : 0u, st, e8 = eng_sel, alt;
         int32_t oct = (int8_t)set.oct, e;
         uint32_t base = (uint32_t)((int32_t)KEY0 + 12 * oct);
         platform_poll();
@@ -1189,40 +1584,47 @@ static void app_main(void)
         if (b & (1u << BTN_LFO)) page = page == P_LFO ? P_HOME : P_LFO;   /* LFO: tempo, pulse, season (again: home) */
         if (b & (1u << BTN_FX)) page = page == P_FX1 ? P_FX2 : P_FX1;     /* FX: round the effect pages */
         if (b & (1u << BTN_GLO)) page = page == P_BOOK ? P_HOME : P_BOOK; /* GLO: the BOOK of spells (again: home) */
-        if ((e = fm1_enc_take(ENC_SELECT)) != 0) {     /* SELECT: the spell's next or last scale (pivoting, as the season) */
-            uint32_t n = SPELL[spell_now].n;
-            cast(spell_now, tonic, (scale_now + (uint32_t)((e % (int32_t)n) + (int32_t)n)) % n);
-            set.scl = (uint8_t)scale_now;
+        alt = fm1_in.notes >> PK_ALT & 1u;      /* F#5 held: the second layer of SELECT, PRESETS and ALGORITHM */
+        if ((e = fm1_enc_take(ENC_SELECT)) != 0) {     /* SELECT: the spell, round the BOOK (F#5: the tempo) */
+            if (alt) { field_turn(F_BPM, e); say_field(F_BPM); }
+            else {
+                set.spl = (uint8_t)(((int32_t)set.spl + e % (int32_t)NSPELL + (int32_t)NSPELL) % (int32_t)NSPELL);
+                set.scl = 0;
+                cast(set.spl, set.tnc, 0);
+                apply();
+                say(SPELL[spell_now].name);
+                turn_ms = fm1_ms;
+            }
             dirty = 1; t_change = fm1_ms;
         }
-        for (k = 0; k < 4u; k++)                /* KNOB 1..4: the page's four settings */
+        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {    /* PRESETS: the spell's next or last scale, pivoting (F#5: CHORDS) */
+            if (alt) { field_turn(F_CHG, e); say_field(F_CHG); }
+            else {
+                uint32_t n = SPELL[spell_now].n;
+                cast(spell_now, tonic, (scale_now + (uint32_t)((e % (int32_t)n) + (int32_t)n)) % n);
+                set.scl = (uint8_t)scale_now;
+                say_scale();
+            }
+            dirty = 1; t_change = fm1_ms;
+        }
+        for (k = 0; k < 4u; k++)                /* KNOB 1..4: the page's four settings (HOME: KNOB 4 the engine) */
             if ((e = fm1_enc_take(ENC_KNOB1 + k)) != 0) {
                 uint32_t f = page_field(page, k);
-                int32_t d;
-                if (f >= F_N) continue;         /* (a display, not a setting) */
-                d = (int32_t)CFG[f] + e;
-                CFG[f] = (uint8_t)(d < (int32_t)CFG_MIN[f] ? (int32_t)CFG_MIN[f] : d > (int32_t)cfg_max(f) ? (int32_t)cfg_max(f) : d);
-                if (f == F_STP || f == F_STP1) {   /* fewer steps: hits and rotation stay inside */
-                    uint32_t i = f - F_STP;
-                    if (set.hit[i] > set.stp[i]) set.hit[i] = set.stp[i];
-                    if (set.rot[i] >= set.stp[i]) set.rot[i] = (uint8_t)(set.stp[i] - 1u);
+                if (page == P_HOME && k == 3u) { engine_turn(e, um_hold, &um_back); say_field(F_ENG); }
+                else if (f >= F_N) continue;    /* (a display, not a setting) */
+                else {
+                    if (field_turn(f, e)) turn_ms = fm1_ms;
+                    if (page == P_HOME) say_field(f);
                 }
-                if (f == F_SPL) set.scl = 0;    /* a new spell: from its first scale */
-                if (f == F_SPL || f == F_TNC || f == F_SCL) { cast(set.spl, set.tnc, set.scl); turn_ms = fm1_ms; }
-                apply();
-                if (f == F_DEN && set.den == DEN_GROW) { grow_dir = density >= DV ? -1 : 1; grow_wait(); }   /* GROW: on from here */
-                else if (f == F_DEN) set_density(set.den);
-                if (f == F_SPR || f == F_PIT) revoice();
                 dirty = 1; t_change = fm1_ms;
             }
-        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the engine's timbre, round the ring */
-            set.tim[eng_sel] = (uint8_t)(((int32_t)set.tim[eng_sel] + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
-            apply();
-            dirty = 1; t_change = fm1_ms;
-        }
-        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {   /* PRESETS: the MIDI channel */
-            int32_t c = (int32_t)set.ch + e;
-            set.ch = (uint8_t)(c < 0 ? 0 : c > 16 ? 16 : c);
+        if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {   /* ALGORITHM: the engine's timbre, round the ring (F#5: DENSITY) */
+            if (alt) { field_turn(F_DEN, e); say_field(F_DEN); }
+            else {
+                set.tim[eng_sel] = (uint8_t)(((int32_t)set.tim[eng_sel] + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
+                apply();
+                say(TIM_NAME[set.tim[eng_sel]]);
+            }
             dirty = 1; t_change = fm1_ms;
         }
 
@@ -1238,6 +1640,7 @@ static void app_main(void)
             set.scl = (uint8_t)scale_now;
             set.tnc = (uint8_t)tonic;
             dirty = 1; t_change = fm1_ms; turn_ms = fm1_ms;
+            say_scale();                        /* (HOME: its name, a moment) */
         }
         grow_tick(set.den == DEN_GROW);
         cycle_tick(set.bpm, set.rat[eng_sel], set.stp[eng_sel], set.hit[eng_sel], set.rot[eng_sel], set.chc);
@@ -1254,7 +1657,7 @@ static void app_main(void)
             if (drone[k].vamp > 2000 && drone[k].note >= base && drone[k].note < base + 27u)
                 lit |= 1u << (drone[k].note - base);
         lit &= (1u << KEY_PLAY) - 1u;           /* the performance keys: lit while they act */
-        lit |= (uint32_t)um_hold << PK_UMWELT;
+        lit |= (uint32_t)um_hold << PK_UMWELT | (fm1_in.notes >> PK_ALT & 1u) << PK_ALT;
         for (k = 0; k < 27u; k++)
             fm1_led_key(KEY_LED(k), lit >> k & 1u);
         fm1_led_key(BTN_SEL, !eng_sel);         /* lit: UMWELT */
@@ -1283,24 +1686,56 @@ static void app_main(void)
         }
 #endif
         kl = turn_ms && fm1_ms - turn_ms < 3000u;   /* the season just turned: the sigil and the scale glow */
-        if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
-        if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
-        if ((st = drone_on ? 1000u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u : 0u) != note_drawn) { note_drawn = st; draw_note(); }
-        fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
-        snd = 0;                                /* EVENTS, BLOOM: the nodes of the voices sounding now */
-        if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
-        if ((st = density | (uint32_t)drone_on << 4 | fl << 5 | snd << 6 | (uint32_t)(set.den == DEN_GROW) << 12) != net_drawn) { net_drawn = st; draw_network(density, (uint32_t)drone_on, (int)fl, snd, set.den == DEN_GROW); }
-        if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
-        st = page | cpu_pct << 3 | e8 << 12;    /* the panel: redrawn when the page, a value on it or the CPU changes */
-        for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
-        if (st != knobs_drawn) { knobs_drawn = st; draw_knobs(page, cpu_pct); }
-        if (page != tabs_drawn) { tabs_drawn = page; draw_tabs(page); }
-        if ((st = page == P_BOOK ? 1000u + cpu_pct : 0u) != cpu_drawn) {   /* the BOOK: the CPU load, top right */
-            char c[12], *q = c;
-            cpu_drawn = st;
-            if (st) { put(&q, "CPU "); fmt_field(&q, F_CPU, cpu_pct); }
-            *q = 0;
-            draw_text_box(184, 4, 56, &FONT_S, c, C_OFF, 2);
+        if ((page == P_HOME) != (shown == P_HOME)) {   /* HOME and the other pages: each its own screen */
+            lcd_fill(0, 0, 240, 240, C_BLACK);
+            sigil_drawn = scale_drawn = note_drawn = net_drawn = info_drawn = knobs_drawn = tabs_drawn = cpu_drawn = ~0u;
+            chord_drawn = label_drawn = ~0u;
+            if (page != P_HOME) draw_text_box(0, 4, 240, &FONT_S, APP_NAME, C_ACC, 1);
+            sg.sp = 99u;                        /* (back home: the sigil as it is, no growing) */
+        }
+        shown = page;
+        if (page == P_HOME) {                   /* HOME: the sigil and the ground take turns, each ~14 frames a second at most */
+            uint32_t now = fm1_ms, lv = 0;
+            const char *ls = "";
+            char hint[34];
+            if (now - sg_drawn_t >= 70u && (!home_turn || now - my_drawn_t < 70u)) { draw_home_sigil(now, (int)kl); sg_drawn_t = now; home_turn = 1; }
+            else if (now - my_drawn_t >= 70u) { draw_mycelium(now, set.den == DEN_GROW); my_drawn_t = now; home_turn = 0; }
+            if ((st = drone_on ? 1u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u + kl * 16384u : 0u) != chord_drawn) {
+                char c[16], *q = c;             /* the chord, small, at the top */
+                chord_drawn = st;
+                if (st) { put(&q, PC_NAME[cpc(chord_now, 0)]); put(&q, chord_qual(chord_now)); }
+                *q = 0;
+                draw_text_box(0, 2, 240, &FONT_S, c, lite(kl ? 235 : 150), 1);
+            }
+            if (say_v && now - say_t < 1800u) { ls = say_s; lv = say_v; }   /* what was just turned, a moment */
+            else if (alt) {                     /* F#5 held: what the second layer holds */
+                char *q = hint;
+                put(&q, "BPM "); put_num(&q, set.bpm); put(&q, "  CHORDS "); fmt_field(&q, F_CHG, 0);
+                put(&q, "  DENS "); fmt_field(&q, F_DEN, 0);
+                *q = 0;
+                ls = hint; lv = 0x80000000u | set.bpm | (uint32_t)set.chg << 8 | (uint32_t)set.den << 12;
+            }
+            if (lv != label_drawn) { label_drawn = lv; draw_text_box(0, 222, 240, &FONT_S, ls, lite(150), 1); }
+        } else {
+            if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
+            if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
+            if ((st = drone_on ? 1000u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u : 0u) != note_drawn) { note_drawn = st; draw_note(); }
+            fl = drone_on && pulse_ms && fm1_ms - pulse_ms < 300u;
+            snd = 0;                                /* EVENTS, BLOOM: the nodes of the voices sounding now */
+            if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
+            if ((st = density | (uint32_t)drone_on << 4 | fl << 5 | snd << 6 | (uint32_t)(set.den == DEN_GROW) << 12) != net_drawn) { net_drawn = st; draw_network(density, (uint32_t)drone_on, (int)fl, snd, set.den == DEN_GROW); }
+            if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
+            st = page | cpu_pct << 3 | e8 << 12;    /* the panel: redrawn when the page, a value on it or the CPU changes */
+            for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
+            if (st != knobs_drawn) { knobs_drawn = st; draw_knobs(page, cpu_pct); }
+            if (page != tabs_drawn) { tabs_drawn = page; draw_tabs(page); }
+            if ((st = page == P_BOOK ? 1000u + cpu_pct : 0u) != cpu_drawn) {   /* the BOOK: the CPU load, top right */
+                char c[12], *q = c;
+                cpu_drawn = st;
+                if (st) { put(&q, "CPU "); fmt_field(&q, F_CPU, cpu_pct); }
+                *q = 0;
+                draw_text_box(184, 4, 56, &FONT_S, c, C_OFF, 2);
+            }
         }
         idle_ok = 0;
 
