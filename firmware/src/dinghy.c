@@ -7,8 +7,8 @@
  *   OCT- OCT+  the octave (kept in flash)
  *   HOME       SELECT the spell, PRESETS its scale, ALGORITHM the voice; F#5 (a press, lit while on): BPM, CHORDS,
  *              DENSITY instead. KNOB 1..4: SPREAD, PITCH, PULSE, DRONE / EVENTS / BLOOM
- *   pages      SEL season, roots, shape; ENV the envelopes (again: DRONE, EVENTS, BLOOM); LFO 1, 2; ARP the cycle,
- *              chance; FX 1, 2; GLO the BOOK; EDIT empty for now. REC: a tap rolls the sound and rhythm, a hold undoes
+ *   pages      SEL season, roots, shape, tonic; ENV the envelopes (again: DRONE, EVENTS, BLOOM); LFO 1, 2; ARP the
+ *              cycle, chance (drawn as a ring); FX 1, 2; GLO and EDIT empty for now. G5 held: UMWELT DRONE. REC: a tap rolls the sound and rhythm, a hold undoes
  *   MIDI ch    kept in flash, tucked away for now
  *   MASTER     the volume (platform.c)
  *   MIDI in    notes from USB or the TRS jack play the sines, with their velocity; a MIDI clock shows its tempo
@@ -106,8 +106,8 @@ static int32_t shape(uint32_t t, uint32_t pa, uint32_t pb, uint32_t band, int32_
     switch (t) {
     case 1u: {                                  /* MIST: the pair an octave up, the fundamental faint, breath around it */
         int32_t s = (((sine(pa << 1) + sine(pb << 1)) * 13107) >> 15) + ((sine(pa) * 5461) >> 15) + (sine(pa * 3u) >> 4);
-        *nlp += ((nz - *nlp) * 6000) >> 15;     /* noise below ~1.4 kHz ... */
-        return s + ((*nlp * sine(pa << 1)) >> 14);   /* ... carried up to the octave: a breathy band around the tone */
+        *nlp += ((nz - *nlp) * 2600) >> 15;     /* noise below ~600 Hz (softer: was ~1.4 kHz) ... */
+        return s + ((*nlp * sine(pa << 1)) >> 15);   /* ... carried up to the octave, at half the level it was: a soft breath */
     }
     case 2u: return (wt(CHOIR_WT[band], pa) + wt(CHOIR_WT[band], pb)) >> 1;   /* CHOIR: an "ah", two singers */
     case 3u: return (wt(ORGAN_WT, pa) + wt(ORGAN_WT, pb)) >> 1;                /* ORGAN: drawbars */
@@ -868,21 +868,22 @@ static const char *const F_NAME[F_N + 2] = {"OCT", "CH", "DENSITY", "PULSE", "SH
 /* the keys: 0..23 play (F3..E5, in BLOOM's sound); the top three (F5, F#5, G5) are performance keys */
 #define KEY_PLAY 24u
 #define PK_ALT 25u                              /* F#5: a press turns the second layer of SELECT, PRESETS, ALGORITHM on / off */
-#define PK_UMWELT 26u                           /* G5, the top key: UMWELT while held (BLOOM's cycles wait) */
+#define PK_UMWELT 26u                           /* G5, the top key: UMWELT DRONE while held (the cycles wait) */
 static uint32_t um_hold, um_back;               /* the UMWELT key is held; the engine to go back to */
 /* the pages: HOME; SEL (season, roots, shape); ENV (DRONE, EVENTS or BLOOM's: ENV again picks which); LFO 1, 2; ARP 1
  * (the cycle), 2 (chance); FX 1, 2; the BOOK (GLO); EDIT (empty, for now) */
 enum { P_HOME, P_SEL, P_ENV, P_LFO1, P_LFO2, P_ARP1, P_ARP2, P_FX1, P_FX2, P_BOOK, P_EDIT, NPAGE };
-static const char *const PAGE_NAME[NPAGE] = {"", "SEL", "ENV", "LFO 1", "LFO 2", "ARP", "ARP 2", "FX 1", "FX 2", "BOOK", "EDIT"};
+static const char *const PAGE_NAME[NPAGE] = {"", "SEL", "ENV", "LFO 1", "LFO 2", "ARP", "ARP 2", "FX 1", "FX 2", "GLO", "EDIT"};
 static uint32_t env_ed;                         /* the envelope ENV shows: 0 DRONE, 1 EVENTS, 2 BLOOM (the sound as it is) */
 static const char *const ENV_NAME[3] = {"DRONE", "EVENTS", "BLOOM"};
-static uint32_t env_ix(void) { return eng_sel ? 2u : set.umd; }   /* the envelope in use: DRONE, EVENTS or BLOOM */
+static uint32_t umd_now(void) { return um_hold ? 0u : set.umd; }   /* UMWELT's mode now (the G5 key held: DRONE) */
+static uint32_t env_ix(void) { return eng_sel ? 2u : umd_now(); }   /* the envelope in use: DRONE, EVENTS or BLOOM */
 static uint32_t page_field(uint32_t page, uint32_t k)
 {
     static const uint8_t PF[NPAGE][4] = {{F_SPR, F_PIT, F_PUL, F_UMD},   /* (HOME's KNOB 4 is the engine: engine_turn) */
-        {F_SEA, F_ROO, F_SHP, F_NONE}, {F_NONE, F_NONE, F_NONE, F_NONE}, {F_LR, F_LS, F_LD, F_LT}, {F_LR1, F_LS1, F_LD1, F_LT1},
+        {F_SEA, F_ROO, F_SHP, F_TNC}, {F_NONE, F_NONE, F_NONE, F_NONE}, {F_LR, F_LS, F_LD, F_LT}, {F_LR1, F_LS1, F_LD1, F_LT1},
         {F_STP, F_HIT, F_ROT, F_RAT}, {F_CHC, F_NONE, F_NONE, F_NONE}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB},
-        {F_SPL, F_TNC, F_SCL, F_NONE}, {F_NONE, F_NONE, F_NONE, F_NONE}};
+        {F_NONE, F_NONE, F_NONE, F_NONE}, {F_NONE, F_NONE, F_NONE, F_NONE}};
     static const uint8_t ENV_F[3][4] = {{F_ATT, F_REL, F_BRT, F_GLD}, {F_ATT1, F_DEC, F_SUS, F_REL1}, {F_ATT2, F_DEC1, F_SUS1, F_REL2}};
     uint32_t f = page == P_ENV ? ENV_F[env_ed][k] : PF[page][k];
     if (f == F_TIM || f == F_STP || f == F_HIT || f == F_ROT || f == F_RAT) return f + eng_sel;
@@ -954,8 +955,8 @@ static void apply(void)                         /* the settings to the sound */
     key_att = ATT_INC[set.att[2]];
     key_dec = REL_K[set.dec[1]];
     key_sus = (uint32_t)set.sus[1] * 32767u / 20u;
-    um_mode = set.umd;
-    engine = eng_sel || set.umd;                /* the audio: 0 hold (DRONE), 1 triggered (EVENTS, BLOOM) */
+    um_mode = umd_now();
+    engine = eng_sel || um_mode;                /* the audio: 0 hold (DRONE), 1 triggered (EVENTS, BLOOM) */
     trig_boost = eng_sel;
     env_att = ATT_INC[set.att[env_ix()]];
     if (env_ix()) { env_dec = REL_K[set.dec[env_ix() - 1u]]; env_sus = (uint32_t)set.sus[env_ix() - 1u] * 32767u / 20u; }
@@ -1101,7 +1102,7 @@ static void draw_info(void)                     /* "WHEEL   UMWELT DRONE   MOSS"
 {
     char s[44], *p = s;
     put(&p, SPELL[spell_now].name); put(&p, "  ");
-    put(&p, eng_sel ? "BLOOM" : set.umd ? "UM EVENTS" : "UM DRONE"); put(&p, "  "); put(&p, TIM_NAME[set.tim[eng_sel]]);
+    put(&p, eng_sel ? "BLOOM" : um_mode ? "UM EVENTS" : "UM DRONE"); put(&p, "  "); put(&p, TIM_NAME[set.tim[eng_sel]]);
     *p = 0;
     draw_text_box(0, 136, 240, &FONT_S, s, C_OFF, 1);
 }
@@ -1514,6 +1515,55 @@ static void draw_mycelium(uint32_t now, int grow_mode)
     cv_blit(0, MY_Y);
 }
 
+
+/* ---- ARP: the cycle as a ring. Its steps round a circle from the top, the hits joined into the cycle's figure; the
+ * step now runs round (the hand), a hit flares as it sounds; the first step (the accent) ringed. BLOOM: a hit's light
+ * as likely as CHANCE makes it. UMWELT DRONE has no cycle: the ring dims and the hand stops. */
+#define ARP_Y 24u
+#define ARP_H 104
+static void arp_pt(uint32_t i, uint32_t n, int32_t r, int32_t *x, int32_t *y)
+{
+    uint32_t a = 0xFFFFFFFFu / n * i - 0x40000000u;   /* (no 64-bit division on the chip) */
+    *x = 120 + sx(a, r); *y = ARP_H / 2 + sy(a, r);
+}
+static void draw_arp(uint32_t now)
+{
+    uint32_t n = set.stp[eng_sel], h = set.hit[eng_sel], ro = set.rot[eng_sel], i, half, first = n;
+    int on = drone_on && (eng_sel || um_mode), fl = on && hit_ms && now - hit_ms < 220u;
+    int32_t x, y, x0, y0, fx = 0, fy = 0, cur = on ? (int32_t)((cyc_step + n - 1u) % n) : -1, gl;
+    uint16_t dim = lite(on ? 58 : 36), lit = lite(on ? 60 + (int32_t)(eng_sel ? set.chc : 20u) * 6 : 70);
+    gl = fl ? 255 - (int32_t)(now - hit_ms) * 80 / 220 : 0;
+    for (half = 0; half < 2u; half++) {
+        cv_begin(240, ARP_H / 2, C_BLACK);
+        cv_oy = -(int32_t)half * (ARP_H / 2);
+        for (i = 0; i < 72u; i++) {             /* the circle */
+            arp_pt(i, 72u, 44, &x, &y); arp_pt(i + 1u, 72u, 44, &x0, &y0);
+            if (i & 1u) cv_line(x, y, x0, y0, dim);
+        }
+        for (i = 0; i < n; i++) {               /* the figure: hit to hit */
+            if (!euclid(i, n, h, ro)) continue;
+            arp_pt(i, n, 44, &x, &y);
+            if (first == n) { first = i; fx = x; fy = y; }
+            else cv_line(x0, y0, x, y, lite(on ? 90 : 46));
+            x0 = x; y0 = y;
+        }
+        if (first < n && h > 1u) cv_line(x0, y0, fx, fy, lite(on ? 90 : 46));
+        if (cur >= 0) {                         /* the hand */
+            arp_pt((uint32_t)cur, n, 36, &x, &y);
+            cv_line(120, ARP_H / 2, x, y, lite(70));
+        }
+        for (i = 0; i < n; i++) {               /* the steps */
+            int hit = euclid(i, n, h, ro);
+            arp_pt(i, n, 44, &x, &y);
+            if (i == 0u) { arp_pt(i, n, 52, &x0, &y0); cv_rect(x0 - 1, y0 - 1, 3, 3, lite(on ? 150 : 60)); }   /* the accent */
+            if ((int32_t)i == cur && hit && fl) { cv_rect(x - 4, y - 4, 9, 9, lite(gl)); continue; }
+            if (hit) cv_rect(x - 3, y - 3, 7, 7, (int32_t)i == cur ? lite(235) : lit);
+            else cv_rect(x - 1, y - 1, 3, 3, (int32_t)i == cur ? lite(200) : dim);
+        }
+        cv_blit(0, ARP_Y + half * (ARP_H / 2));
+    }
+    cv_oy = 0;
+}
 /* words for a moment */
 static char say_s[2][20];                       /* words for a moment: [0] left, the harmony; [1] right, the rest */
 static uint32_t say_t[2], say_v[2];
@@ -1653,7 +1703,7 @@ static void app_idle(void)                      /* while the screen draws: MIDI 
 static void app_main(void)
 {
     uint32_t prev = 0, k, t_change = 0, dirty = 0, note_drawn = ~0u, scale_drawn = ~0u, info_drawn = ~0u, sigil_drawn = ~0u;
-    uint32_t net_drawn = ~0u, knobs_drawn = ~0u, chord_drawn = ~0u, label_drawn = ~0u, label2_drawn = ~0u, title_drawn = ~0u, bpm_drawn = ~0u, shown = NPAGE, sg_drawn_t = 0, my_drawn_t = 0, home_turn = 0, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0, cpu_drawn = 0;
+    uint32_t arp_on = 0, arp_drawn = ~0u, arp_t = 0, net_drawn = ~0u, knobs_drawn = ~0u, chord_drawn = ~0u, label_drawn = ~0u, label2_drawn = ~0u, title_drawn = ~0u, bpm_drawn = ~0u, shown = NPAGE, sg_drawn_t = 0, my_drawn_t = 0, home_turn = 0, turn_ms = 0, kl, fl, snd, page = P_HOME, cpu_pct = 0, cpu_drawn = 0;
 #ifndef DINGHY_HOST
     uint32_t cpu_t = 0;
 #endif
@@ -1689,7 +1739,7 @@ static void app_main(void)
         up = prev & ~keys;
         prev = keys;
         if (down >> PK_ALT & 1u) { alt_on ^= 1u; say(alt_on ? "LAYER 2" : "LAYER 1"); }   /* F#5: the second layer on / off */
-        if (down >> PK_UMWELT & 1u) { um_back = eng_sel; um_hold = 1; eng_sel = 0; apply(); }   /* held: UMWELT */
+        if (down >> PK_UMWELT & 1u) { um_back = eng_sel; um_hold = 1; eng_sel = 0; apply(); }   /* held: UMWELT DRONE */
         if (up >> PK_UMWELT & 1u && um_hold) { um_hold = 0; eng_sel = um_back; apply(); }        /* let go: back */
         for (k = 0; k < KEY_PLAY; k++) {            /* (a key stops the note it started: the octave may change meanwhile) */
 #if BOARD_SMK37
@@ -1823,7 +1873,7 @@ static void app_main(void)
         fm1_led_key(BTN_GLO, page == P_BOOK);
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
-        fm1_led_key(BTN_PLAY, drone_on ? !hit_ms || fm1_ms - hit_ms > 60u || (!eng_sel && !set.umd) : clk_run);   /* lit: growing; a blink a hit */
+        fm1_led_key(BTN_PLAY, drone_on ? !hit_ms || fm1_ms - hit_ms > 60u || (!eng_sel && !um_mode) : clk_run);   /* lit: growing; a blink a hit */
 #if BOARD_SMK37
         for (k = 0; k < 16u; k++) {             /* a pad glows while its key sounds */
             uint32_t w = k < 8u ? k + 8u : k - 8u, on = lit >> WHITE[w] & 1u;
@@ -1845,6 +1895,7 @@ static void app_main(void)
             lcd_fill(0, 0, 240, 240, C_BLACK);
             sigil_drawn = scale_drawn = note_drawn = net_drawn = info_drawn = knobs_drawn = cpu_drawn = ~0u;
             chord_drawn = label_drawn = label2_drawn = title_drawn = bpm_drawn = ~0u;
+            arp_on = 0;
             sg.sp = 99u;                        /* (back home: the sigil as it is, no growing) */
         }
         shown = page;
@@ -1879,7 +1930,14 @@ static void app_main(void)
             lv = 0; ls = "";
             if (say_v[1] && now - say_t[1] < 1800u) { ls = say_s[1]; lv = say_v[1]; }   /* right: what was just turned */
             if (lv != label2_drawn) { label2_drawn = lv; draw_text_box(120, 216, 114, &FONT_S, ls, lite(150), 2); }
-        } else {
+        } else if (page == P_ARP1 || page == P_ARP2) {   /* ARP: the ring in place of the sigil, scale and network */
+            if (!arp_on) { lcd_fill(0, ARP_Y, 240, ARP_H + 4u, C_BLACK); arp_on = 1; arp_drawn = ~0u; }
+            st = cyc_step | set.stp[e8] << 6 | set.hit[e8] << 12 | set.rot[e8] << 18 | e8 << 24 | (uint32_t)drone_on << 25 | um_mode << 26
+                 | (uint32_t)(hit_ms && fm1_ms - hit_ms < 240u) << 27 | (uint32_t)set.chc << 28;
+            if ((st != arp_drawn || (hit_ms && fm1_ms - hit_ms < 240u)) && fm1_ms - arp_t >= 40u) { arp_drawn = st; arp_t = fm1_ms; draw_arp(fm1_ms); }
+        }
+        if (page != P_HOME && !(page == P_ARP1 || page == P_ARP2)) {
+            if (arp_on) { lcd_fill(0, ARP_Y, 240, ARP_H + 4u, C_BLACK); arp_on = 0; sigil_drawn = scale_drawn = note_drawn = net_drawn = ~0u; }
             if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
             if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
             if ((st = drone_on ? 1000u + chord_now + scale_now * 8u + spell_now * 128u + tonic * 1024u : 0u) != note_drawn) { note_drawn = st; draw_note(); }
@@ -1887,7 +1945,9 @@ static void app_main(void)
             snd = 0;                                /* EVENTS, BLOOM: the nodes of the voices sounding now */
             if (engine) for (k = 0; k < DV; k++) if (drone[k].vamp > 6000) snd |= 1u << RANK[k];
             if ((st = density | (uint32_t)drone_on << 4 | fl << 5 | snd << 6 | (uint32_t)(set.den == DEN_GROW) << 12) != net_drawn) { net_drawn = st; draw_network(density, (uint32_t)drone_on, (int)fl, snd, set.den == DEN_GROW); }
-            if ((st = spell_now | e8 << 4 | (uint32_t)set.umd << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
+        }
+        if (page != P_HOME) {
+            if ((st = spell_now | e8 << 4 | um_mode << 5 | (uint32_t)set.tim[e8] << 6) != info_drawn) { info_drawn = st; draw_info(); }
             st = page | cpu_pct << 3 | e8 << 12;    /* the panel: redrawn when the page, a value on it or the CPU changes */
             for (k = 0; k < 4u; k++) { uint32_t f = page_field(page, k); st = st * 31u + (f < F_N ? CFG[f] : 0u) + f * 7u; }
             if (st != knobs_drawn) { knobs_drawn = st; draw_knobs(page, cpu_pct); }
