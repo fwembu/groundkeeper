@@ -6,7 +6,7 @@
  *   keys       play sines, 4 voices; the notes go out over USB-MIDI too, on the MIDI channel
  *   OCT- OCT+  the octave (kept in flash)
  *   HOME       SELECT the spell, PRESETS its scale, ALGORITHM DRONE / EVENTS / BLOOM; KNOB 1..4: VOICE, COLOUR, PULSE,
- *              CHORDS. F#5 (a press, lit while on): SELECT BPM; KNOB 1..3 DENSITY, SPREAD, PITCH (the rest free)
+ *              CHORDS. F#5 (a press, lit while on): SELECT BPM, PRESETS TONIC; KNOB 1..4 DENSITY, SPREAD, PITCH, MUTATE
  *   pages      SEL season, roots, shape, tonic; ENV the envelopes (again: DRONE, EVENTS, BLOOM); LFO 1, 2; ARP the
  *              cycle, chance (drawn as a ring); FX 1, 2; GLO and EDIT empty for now. G5 held: UMWELT DRONE. REC: a tap rolls the sound and rhythm, a hold undoes
  *   MIDI ch    kept in flash, tucked away for now
@@ -1654,7 +1654,7 @@ static int field_turn(uint32_t f, int32_t e)    /* a setting turned e detents; 1
 }
 static uint32_t home_field(uint32_t k, uint32_t alt)   /* HOME's knobs: VOICE, COLOUR, PULSE, CHORDS; F#5: DENSITY, SPREAD, PITCH, - */
 {
-    static const uint8_t L2[4] = {F_DEN, F_SPR, F_PIT, F_NONE};
+    static const uint8_t L2[4] = {F_DEN, F_SPR, F_PIT, F_NONE};   /* (KNOB 4: MUTATE, in the main loop) */
     if (alt) return L2[k];
     switch (k) {
     case 0u: return F_TIM + eng_sel;
@@ -1717,6 +1717,33 @@ static void unroll(void)                        /* swap back: what was there bef
     if (!roll_ok) return;
     for (k = 0; k < sizeof set; k++) { uint8_t t = CFG[k]; CFG[k] = roll_back[k]; roll_back[k] = t; }
     rolled(old_den);
+}
+/* MUTATE (HOME, F#5, KNOB 4): each detent nudges one of the sound's settings a step, at random (the voice's COLOUR
+ * among them; not the voice, the LFOs' targets or shapes). A burst of turns is one roll to REC: a hold puts it back. */
+static uint32_t mut_t;
+static uint32_t mutate(int32_t e)               /* -> the setting it nudged last */
+{
+    uint32_t k, n = e < 0 ? (uint32_t)-e : (uint32_t)e, f = F_CUT, old_den = set.den, i;
+    if (!roll_ok || fm1_ms - mut_t > 3000u) { for (k = 0; k < sizeof set; k++) roll_back[k] = CFG[k]; roll_ok = 1; }
+    mut_t = fm1_ms;
+    if (n > 4u) n = 4u;
+    while (n--) {
+        uint32_t r = rnd(sizeof ROLL / sizeof ROLL[0] + 1u), lo, hi;
+        int32_t d;
+        if (r == sizeof ROLL / sizeof ROLL[0]) { f = F_COL + set.tim[eng_sel]; lo = 1u; hi = 9u; }
+        else { f = ROLL[r][0]; lo = ROLL[r][1]; hi = ROLL[r][2]; }
+        if (f == F_TIM || f == F_TIM1 || f == F_LT || f == F_LT1 || f == F_LS || f == F_LS1 || f == F_SHP) { n++; continue; }
+        d = (int32_t)CFG[f] + (rnd(2u) ? 1 : -1);
+        if (d < (int32_t)lo) d = (int32_t)lo + 1;   /* (at an edge: back inside) */
+        if (d > (int32_t)hi) d = (int32_t)hi - 1;
+        CFG[f] = (uint8_t)d;
+    }
+    for (i = 0; i < 2u; i++) {                  /* (the cycles' hits and turn stay inside their steps) */
+        if (set.hit[i] > set.stp[i]) set.hit[i] = set.stp[i];
+        if (set.rot[i] >= set.stp[i]) set.rot[i] = (uint8_t)(set.stp[i] - 1u);
+    }
+    rolled(old_den);
+    return f;
 }
 static uint32_t alt_on, rec_t, rec_done = 1;    /* F#5's second layer on; REC pressed at, and dealt with */
 /* ---- MIDI in: from the main loop, and from app_idle while the screen draws (idle_ok) */
@@ -1855,8 +1882,8 @@ static void app_main(void)
             }
             dirty = 1; t_change = fm1_ms;
         }
-        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {    /* PRESETS: the spell's next or last scale, pivoting (F#5: free) */
-            if (alt) {}
+        if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {    /* PRESETS: the spell's next or last scale, pivoting (F#5: the tonic) */
+            if (alt) { field_turn(F_TNC, e); say_scale(); turn_ms = fm1_ms; }
             else {
                 uint32_t n = SPELL[spell_now].n;
                 cast(spell_now, tonic, (scale_now + (uint32_t)((e % (int32_t)n) + (int32_t)n)) % n);
@@ -1868,6 +1895,7 @@ static void app_main(void)
         for (k = 0; k < 4u; k++)                /* KNOB 1..4: the page's four settings (HOME: its own, two layers) */
             if ((e = fm1_enc_take(ENC_KNOB1 + k)) != 0) {
                 uint32_t f = page == P_HOME ? home_field(k, alt) : page_field(page, k);
+                if (page == P_HOME && alt && k == 3u) { say_field(mutate(e)); dirty = 1; t_change = fm1_ms; continue; }   /* MUTATE */
                 if (page == P_HOME && f == F_TIM + eng_sel) {   /* the voice: round the ring */
                     set.tim[eng_sel] = (uint8_t)(((int32_t)set.tim[eng_sel] + e % (int32_t)NT + (int32_t)NT) % (int32_t)NT);
                     apply();
