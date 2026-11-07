@@ -91,6 +91,23 @@ def main():
     out.append("/* REED (a muted oboe): a formant near 1.1 kHz (and 2.8 kHz), a weak fundamental, rolled off above 3 kHz */")
     out.append(c_tables("REED_WT", reed))
 
+    # BOW: a bowed string: a sawtooth's harmonics (1/k) with a wooden body: resonances near 280 Hz, 500 Hz and 2.5 kHz
+    rb = random.Random(7)
+    bow = []
+    for b in range(NBAND):
+        lo = BAND0 + b * BAND_STEP
+        f0 = hz(lo + BAND_STEP / 2.0)
+        top = min(17000.0, 17000.0 * f0 / hz(lo + BAND_STEP))
+        amps, k = [], 1
+        while k * f0 < top:
+            f = k * f0
+            body = 0.6 + sum(a / (1.0 + ((f - F) / B) ** 2) for F, B, a in [(280, 90, 0.9), (500, 160, 0.7), (2500, 700, 0.5)])
+            amps.append(body / k ** 1.05 * (1.0 if f < 5000 else 5000.0 / f))
+            k += 1
+        bow.append(table(amps, [rb.uniform(0, 2 * math.pi) for _ in amps]))
+    out.append("/* BOW (a bowed string): sawtooth harmonics through a wooden body (280, 500 Hz, 2.5 kHz); a table a band */")
+    out.append(c_tables("BOW_WT", bow))
+
     # envelopes, per block. ATTACK: linear to full in T s. RELEASE: exponential, -60 dB in T s.
     att = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
     rel = [0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
