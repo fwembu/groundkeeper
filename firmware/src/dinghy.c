@@ -1082,10 +1082,11 @@ static void draw_tabs(uint32_t page)            /* the bottom line: the pages, t
  * the soil and grow the next one. Below it the network, as mycelium in the ground: DENSITY the nodes grown, SPREAD
  * how far its threads reach, PITCH how deep it lies (above the soil: high). A node shines as its voice sounds; a pulse
  * runs out along the threads. Words only for a moment: what was just turned, or the scale after the season turns. */
-#define SG_X 40u                                /* the sigil: 160 x 128 at (40, 20) */
-#define SG_Y 20u
+#define SG_X 40u                                /* the sigil: 160 x 124 at (40, 24) */
+#define SG_Y 24u
 #define SG_W 160
-#define SG_H 128
+#define SG_H 124
+#define SG_SC 220                               /* the figure drawn at 220/256 of its size, round its middle */
 #define SG_CX 80
 #define SG_CY 62
 #define MY_Y 150u                               /* the ground: 240 x 66 at (0, 150) */
@@ -1121,7 +1122,10 @@ static int sg_on(int32_t x, int32_t y)
     d = (uint32_t)((x - SG_CX) * (x - SG_CX) + (y - SG_H) * (y - SG_H)) * 256u / 23000u;   /* from the soil, below the middle */
     return d + (h >> 2) < sg_amt;
 }
-static void sg_pset(int32_t x, int32_t y, uint16_t c) { if (sg_on(x, y)) cv_pset(x, y, c); }
+static void sg_pset(int32_t x, int32_t y, uint16_t c)
+{
+    if (sg_on(x, y)) cv_pset(SG_CX + (x - SG_CX) * SG_SC / 256, SG_CY + (y - SG_CY) * SG_SC / 256, c);
+}
 static void sg_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint16_t c)
 {
     int32_t dx = x1 > x0 ? x1 - x0 : x0 - x1, sx_ = x0 < x1 ? 1 : -1, dy = y1 > y0 ? y0 - y1 : y1 - y0, sy_ = y0 < y1 ? 1 : -1;
@@ -1705,7 +1709,7 @@ static void app_main(void)
                 chord_drawn = st;
                 if (st) { put(&q, PC_NAME[cpc(chord_now, 0)]); put(&q, chord_qual(chord_now)); }
                 *q = 0;
-                draw_text_box(0, 2, 240, &FONT_S, c, lite(kl ? 235 : 150), 1);
+                draw_text_box(0, 6, 240, &FONT_S, c, lite(kl ? 235 : 150), 1);
             }
             if (say_v && now - say_t < 1800u) { ls = say_s; lv = say_v; }   /* what was just turned, a moment */
             else if (alt) {                     /* F#5 held: what the second layer holds */
@@ -1715,7 +1719,7 @@ static void app_main(void)
                 *q = 0;
                 ls = hint; lv = 0x80000000u | set.bpm | (uint32_t)set.chg << 8 | (uint32_t)set.den << 12;
             }
-            if (lv != label_drawn) { label_drawn = lv; draw_text_box(0, 222, 240, &FONT_S, ls, lite(150), 1); }
+            if (lv != label_drawn) { label_drawn = lv; draw_text_box(0, 216, 240, &FONT_S, ls, lite(150), 1); }
         } else {
             if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
             if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
