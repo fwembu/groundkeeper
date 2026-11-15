@@ -13,7 +13,7 @@
  *   the tree   plays with ECO, always: its cycle on ARP (branches, leaves); RAIN strikes notes, WIND swells them.
  *              F5 held: a DOWNPOUR. G5 held: a GUST
  *   pages      SEL season, roots, shape, tonic; ENV the envelopes (again: DRONE, EVENTS, TREE); LFO 1, 2; ARP the
- *              tree's cycle (again: ECO's); FX 1, 2; EDIT; GLO empty for now
+ *              tree's cycle (again: ECO's); FX 1, 2; EDIT; GLO the volumes: ECO, TREE, KEYS, MAIN
  *   REC        a tap: a small mutation; held: a big one. SAVE: undo (eight deep)
  *   MIDI ch    kept in flash, tucked away for now
  *   MASTER     the volume (platform.c)
@@ -95,6 +95,7 @@ static const uint8_t BIRDS[NBIRD] = {2, 1, 9, 7, 5, 0};        /* CHOIR, MIST, H
 static volatile uint8_t tim_col[NT] = {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};   /* the leaves: each timbre's COLOUR, 0 dark .. 5 .. 10 bright (main loop writes) */
 static volatile uint8_t eco_col[NT] = {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};   /* ECO: the same, its own */
 static volatile uint32_t engine;                /* ECO. 0: voices hold (DRONE); 1: voices are triggered (EVENTS) */
+static volatile uint32_t vol_eco = 32767, vol_tree = 32767, vol_key = 32767, vol_out = 32767;   /* the volumes, Q15 (main loop writes) */
 static volatile uint32_t env_att = 63, env_rel = 218, env_dec = 1706, env_sus = 13107;   /* the envelope: ATT_INC, REL_K,
                                                    REL_K, the sustain level Q15 (main loop writes) */
 static volatile uint32_t breath_d = 16384, glide_k = 7;   /* DRONE: BREATH's depth (Q15), GLIDE (a shift; 0: none) */
@@ -262,6 +263,7 @@ static void drone_audio(int32_t *bus, uint32_t n)   /* adds the voices, mono, to
         drone[v].lfo += drone[v].lfo_inc;
         breath = 32767 - (bd >> 1) + ((sine(drone[v].lfo) * (bd >> 1)) >> 15);   /* BREATH: 1 - d .. 1 (d 0.5: 0.5 .. 1) */
         g = (((((((DRONE_GAIN * breath) >> 15) * (int32_t)TGAIN[tn]) >> 15) * lvl) >> 15) * va) >> 15;
+        g = (g * (int32_t)vol_eco) >> 15;
         step = (g - g0) / (int32_t)n;           /* the gain ramps across the block: no steps, even on a fast attack */
         for (i = 0; i < n; i++) {
             int32_t s;
@@ -315,8 +317,10 @@ static int keys_audio(int32_t *bus, uint32_t n)   /* adds the leaves to bus; 1 i
         any = 1;
         inc = (uint32_t)(((uint64_t)voice[v].inc * bend_q16) >> 16);
         incb = inc + (inc >> DETUNE[tn]);
-        g0 = (((KEY_GAIN * (int32_t)TGAIN[tn]) >> 15) * a0) >> 15;
-        g1 = (((KEY_GAIN * (int32_t)TGAIN[tn]) >> 15) * a) >> 15;
+        g1 = (KEY_GAIN * (int32_t)(voice[v].leaf ? vol_tree : vol_key)) >> 15;   /* (the tree's volume, or the keys') */
+        g1 = (g1 * (int32_t)TGAIN[tn]) >> 15;
+        g0 = (g1 * a0) >> 15;
+        g1 = (g1 * a) >> 15;
         step = (g1 - g0) / (int32_t)n;          /* (the gain ramps across the block: no clicks) */
         for (i = 0; i < n; i++) {
             pa += inc;
@@ -385,6 +389,7 @@ static int32_t soft(int32_t x)                  /* above 3/4 of full scale, a qu
 
 static void fx_audio(const int32_t *bus, int32_t *out, uint32_t n, int quiet_in)
 {
+    static int32_t vo = 32767;
     uint32_t i, k;
     int32_t f, q, c, g, m, dry;
     f_now = glide(f_now, CUT_F[fx_cut]);
@@ -458,8 +463,9 @@ static void fx_audio(const int32_t *bus, int32_t *out, uint32_t n, int quiet_in)
             r = ((y0 - y1 - y2 + y3) * (m >> 1)) >> 15;   /* orthogonal to the input's: decorrelated */
         }
         y = (y * dry) >> 15;
-        out[2u * i] += soft(y + l);
-        out[2u * i + 1u] += soft(y + r);
+        vo += ((int32_t)vol_out - vo) >> 7;     /* MAIN, eased: no steps */
+        out[2u * i] += (soft(y + l) * vo) >> 15;
+        out[2u * i + 1u] += (soft(y + r) * vo) >> 15;
     }
 }
 
@@ -946,38 +952,39 @@ static struct {
     uint8_t att[3], rel[3], stp[2], hit[2], rot[2], rat[2], roo;   /* [0] ECO (DRONE; its cycle), [1] EVENTS / the tree's cycle, [2] the tree */
     uint8_t dec[2], sus[2], brt, gld, lr[2], ls[2], ld[2], lt[2];   /* EVENTS, the tree: decay, sustain; DRONE: breath, glide; LFO 1, 2 */
     uint8_t bal, bug, brd, seed;                /* ECO: how many of its six voices are birds; the bug's and the bird's voice; the tree's seed */
+    uint8_t vol[4];                             /* the volumes: ECO, the tree, the keys, all of it */
     uint8_t col[NT], ecol[NT];                  /* each timbre's COLOUR: on the leaves, in ECO */
 } set;
 enum { F_OCT, F_CH, F_DEN, F_PUL, F_SHP, F_SEA, F_CUT, F_RES, F_SPC, F_MIX, F_SPR, F_PIT, F_CHG, F_HIS, F_TON, F_CRK,
        F_WOB, F_BPM, F_SPL, F_TNC, F_SCL, F_UMD, F_RAIN, F_WIND, F_LEAF, F_ATT, F_ATT1, F_ATT2, F_REL, F_REL1,
        F_REL2, F_STP, F_STP1, F_HIT, F_HIT1, F_ROT, F_ROT1, F_RAT, F_RAT1, F_ROO, F_DEC, F_DEC1, F_SUS, F_SUS1,
-       F_BRT, F_GLD, F_LR, F_LR1, F_LS, F_LS1, F_LD, F_LD1, F_LT, F_LT1, F_BAL, F_BUG, F_BRD, F_SEED, F_COL,
-       F_ECOL = F_COL + NT, F_N = F_ECOL + NT, F_CPU = F_N, F_NONE };
+       F_BRT, F_GLD, F_LR, F_LR1, F_LS, F_LS1, F_LD, F_LD1, F_LT, F_LT1, F_BAL, F_BUG, F_BRD, F_SEED, F_VECO,
+       F_VTREE, F_VKEY, F_VOUT, F_COL, F_ECOL = F_COL + NT, F_N = F_ECOL + NT, F_CPU = F_N, F_NONE };
 #define CFG ((uint8_t *)&set)
 static const uint8_t CFG_MIN[F_N] = {
     0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0};
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static const uint8_t CFG_MAX[F_N] = {
     255, 16, DEN_GROW, NPULSE - 1u, NSHAPE - 1u, NSEASON - 1u, NCUT - 1u, NRES - 1u, NSPACE - 1u, NMIX - 1u, 8, 24,
     NCHG - 1u, 20, 10, 20, 10, 200, NSPELL - 1u, 11, 11, 1, 10, 10, NT - 1u, NATT - 1u, NATT - 1u, NATT - 1u,
     NREL - 1u, NREL - 1u, NREL - 1u, 32, 32, 32, 32, 31, 31, NRATE - 1u, NRATE - 1u, NSEASON - 1u, NREL - 1u,
     NREL - 1u, 20, 20, 10, NGLD - 1u, NLR - 1u, NLR - 1u, NLS - 1u, NLS - 1u, 20, 20, NLT - 1u, NLT - 1u, DV,
     NBUG - 1u, NBIRD - 1u, 255, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
-    10, 10, 10, 10, 10};
+    10, 10, 10, 10, 10, 10, 10, 10, 10};
 static const uint8_t CFG_DEF[F_N] = {
     0, 0, 4, 8, 1, 0, NCUT - 1u, 0, 8, 5, 8, 12, 5, 0, 5, 0, 0, 90, 0, 0, 0, 0, 4, 3, 4, 10, 1, 4, 10, 4, 8, 7, 9, 3,
-    5, 0, 0, 1, 1, 0, 2, 5, 8, 12, 5, 5, 2, 10, 0, 4, 0, 0, 1, 3, 3, 0, 0, 7, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};
+    5, 0, 0, 1, 1, 0, 2, 5, 8, 12, 5, 5, 2, 10, 0, 4, 0, 0, 1, 3, 3, 0, 0, 7, 10, 10, 10, 10, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};
 static const char *const F_NAME[F_N + 2] = {
     "OCT", "CH", "DENSITY", "PULSE", "SHAPE", "SEASON", "FILTER", "RES", "SPACE", "MIX", "SPREAD", "PITCH", "CHORDS",
     "HISS", "TONE", "CRACKLE", "WOBBLE", "TEMPO", "SPELL", "TONIC", "SCALE", "ECO", "RAIN", "WIND", "LEAF", "GROW",
     "ATTACK", "ATTACK", "WITHER", "RELEASE", "RELEASE", "STEPS", "BRANCH", "HITS", "LEAVES", "ROTATE", "ROTATE",
     "RATE", "RATE", "ROOTS", "DECAY", "DECAY", "SUS", "SUS", "BREATH", "GLIDE", "RATE", "RATE", "SHAPE", "SHAPE",
-    "DEPTH", "DEPTH", "TARGET", "TARGET", "BIRDS", "BUG", "BIRD", "TREE", "COLOUR", "COLOUR", "COLOUR", "COLOUR",
+    "DEPTH", "DEPTH", "TARGET", "TARGET", "BIRDS", "BUG", "BIRD", "TREE", "ECO", "TREE", "KEYS", "MAIN", "COLOUR",
     "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR",
     "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR", "COLOUR",
-    "CPU", ""};
+    "COLOUR", "COLOUR", "COLOUR", "CPU", ""};
 typedef char set_is_f_n[sizeof set == F_N ? 1 : -1];   /* (a byte a setting, in the F_ order) */
 /* the keys: 0..23 play (F3..E5, in the leaf's voice); the top three (F5, F#5, G5) are performance keys */
 #define KEY_PLAY 24u
@@ -985,7 +992,8 @@ typedef char set_is_f_n[sizeof set == F_N ? 1 : -1];   /* (a byte a setting, in 
 #define PK_ALT 25u                              /* F#5: a press turns the second layer of SELECT, PRESETS, ALGORITHM and HOME's knobs on / off */
 #define PK_GUST 26u                             /* G5, the top key: held, a GUST */
 /* the pages: HOME; SEL (season, roots, shape, tonic); ENV (DRONE, EVENTS or the TREE's: ENV again picks which); LFO 1, 2;
- * ARP: the tree's cycle (again: ECO's); FX 1, 2; the BOOK (GLO, empty for now); EDIT: the bug's and the bird's voice */
+ * ARP: the tree's cycle (again: ECO's); FX 1, 2; GLO: the volumes (ECO, the tree, the keys, all of it); EDIT: the bug's
+ * and the bird's voice */
 enum { P_HOME, P_SEL, P_ENV, P_LFO1, P_LFO2, P_ARP1, P_ARP2, P_FX1, P_FX2, P_BOOK, P_EDIT, NPAGE };
 static const char *const PAGE_NAME[NPAGE] = {"", "SEL", "ENV", "LFO 1", "LFO 2", "ARP TREE", "ARP ECO", "FX 1", "FX 2", "GLO", "EDIT"};
 static uint32_t env_ed;                         /* the envelope ENV shows: 0 DRONE, 1 EVENTS, 2 the TREE */
@@ -996,7 +1004,7 @@ static uint32_t page_field(uint32_t page, uint32_t k)
     static const uint8_t PF[NPAGE][4] = {{F_NONE, F_NONE, F_NONE, F_NONE},   /* (HOME: home_field) */
         {F_SEA, F_ROO, F_SHP, F_TNC}, {F_NONE, F_NONE, F_NONE, F_NONE}, {F_LR, F_LS, F_LD, F_LT}, {F_LR1, F_LS1, F_LD1, F_LT1},
         {F_STP1, F_HIT1, F_ROT1, F_RAT1}, {F_STP, F_HIT, F_ROT, F_RAT}, {F_CUT, F_RES, F_SPC, F_MIX}, {F_HIS, F_TON, F_CRK, F_WOB},
-        {F_NONE, F_NONE, F_NONE, F_NONE}, {F_BUG, F_NONE, F_BRD, F_NONE}};
+        {F_VECO, F_VTREE, F_VKEY, F_VOUT}, {F_BUG, F_NONE, F_BRD, F_NONE}};
     static const uint8_t ENV_F[3][4] = {{F_ATT, F_REL, F_BRT, F_GLD}, {F_ATT1, F_DEC, F_SUS, F_REL1}, {F_ATT2, F_DEC1, F_SUS1, F_REL2}};
     if (page == P_ENV) return ENV_F[env_ed][k];
     if (page == P_EDIT && k == 1u) return F_ECOL + BUGS[set.bug];    /* EDIT: the bug's voice and its COLOUR, the bird's and its */
@@ -1178,6 +1186,7 @@ static void tree_tick(void)
     }
 }
 
+#define VOL_G(v) ((uint32_t)(v) * (v) * 32767u / 100u)   /* a volume 0 .. 10: its gain, Q15 (squared: even to the ear) */
 static void apply(void)                         /* the settings to the sound */
 {
     uint32_t k;
@@ -1195,6 +1204,7 @@ static void apply(void)                         /* the settings to the sound */
     glide_k = engine ? 7u : GLD_K[set.gld];
     chord_every = CHG_N[set.chg];
     for (k = 0; k < NT; k++) { tim_col[k] = set.col[k]; eco_col[k] = set.ecol[k]; }
+    vol_eco = VOL_G(set.vol[0]); vol_tree = VOL_G(set.vol[1]); vol_key = VOL_G(set.vol[2]); vol_out = VOL_G(set.vol[3]);
     creatures(1024u);
     mod_out(1);                                 /* (the rest, as the LFOs move them) */
 }
@@ -1370,6 +1380,7 @@ static void fmt_field(char **q, uint32_t f, uint32_t cpu)   /* a setting's value
     case F_SEA: case F_ROO: fmt_season(q, v); break;
     case F_CUT: put(q, CUT_LABEL[v]); break;
     case F_SPC: put(q, SPACE_LABEL[v]); break;
+    case F_VECO: case F_VTREE: case F_VKEY: case F_VOUT: put_num(q, v * 10u); *(*q)++ = '%'; break;
     case F_MIX: put_num(q, v * 5u); *(*q)++ = '%'; break;
     case F_TON: if (v == 5u) put(q, "WHITE"); else put_signed(q, (int32_t)v - 5); break;
     case F_HIS: case F_CRK: case F_WOB: if (v) put_num(q, v); else put(q, "OFF"); break;
@@ -1663,6 +1674,14 @@ static void draw_home_sigil(uint32_t now, int glow)
         if (now - sg.tcur < T_MOVE) lit = ease((int32_t)((now - sg.tcur) * 256u / T_MOVE));
         sg_figure(sg.sp, now, sg.cur, lit < 256 ? sg.ocur : sg.cur, lit, hi, 1);
     }
+    if (drone_on) {                             /* the wizard's motes: up from the hands to the spell */
+        uint32_t j;
+        for (j = 0; j < 6u; j++) {
+            uint32_t hh = hsh(j * 53u + 9u), ph = (now / 55u + (hh >> 8)) % 26u;
+            int32_t mx = SG_OX + (j & 1u ? 8 : -8) + (((int32_t)(hh % 5u) - 2) * (int32_t)ph) / 6 - ((j & 1u ? 8 : -8) * (int32_t)ph) / 30;
+            cv_pset(mx, SG_H - 1 - (int32_t)ph, lite(200 - (int32_t)ph * 5));
+        }
+    }
     cv_blit(SG_X, SG_Y);
     }
     cv_oy = 0;
@@ -1693,6 +1712,26 @@ static void my_thread_pt(uint32_t r, uint32_t j, uint32_t t, int32_t *x, int32_t
             + (sine(j * 0x2C000000u + h + per(t, 4100u + r * 300u)) * 2 >> 15);
     }
 }
+/* the wizard: on the soil under the sigil, arms up, casting it. The hands twinkle; playing, motes rise from them to
+ * the spell (draw_home_sigil draws those, in its own picture above). */
+#define WZ_X SG_OX
+static void draw_wizard(uint32_t now)
+{
+    int32_t r, sw = (sine(per(now, 2600u)) * 3) >> 16, on = drone_on != 0;   /* (the arms sway a pixel) */
+    uint16_t robe = lite(on ? 120 : 70), hat = lite(on ? 150 : 84), skin = lite(on ? 215 : 110);
+    for (r = 10; r < MY_SOIL; r++) cv_rect(WZ_X - 2 - (r - 10) / 3, r, 5 + 2 * ((r - 10) / 3), 1, robe);   /* the robe */
+    cv_rect(WZ_X - 1, 7, 3, 3, skin);                         /* the face */
+    for (r = 0; r < 6; r++) cv_rect(WZ_X - r / 2, 1 + r, 1 + 2 * (r / 2), 1, hat);   /* the hat, and its brim */
+    cv_rect(WZ_X - 4, 7, 9, 1, hat);
+    cv_line(WZ_X - 3, 11, WZ_X - 8 + sw, 4, robe);            /* the arms, up */
+    cv_line(WZ_X + 3, 11, WZ_X + 8 + sw, 4, robe);
+    cv_pset(WZ_X - 8 + sw, 3, skin); cv_pset(WZ_X + 8 + sw, 3, skin);   /* the hands */
+    if (on) {                                                 /* a twinkle at each */
+        uint16_t tw = lite(140 + ((sine(per(now, 700u)) * 110) >> 15));
+        cv_pset(WZ_X - 9 + sw, 1, tw); cv_pset(WZ_X - 7 + sw, 1, tw);
+        cv_pset(WZ_X + 7 + sw, 1, tw); cv_pset(WZ_X + 9 + sw, 1, tw);
+    }
+}
 static void draw_mycelium(uint32_t now, int grow_mode)
 {
     uint32_t r, j, dt = now - my_t;
@@ -1717,6 +1756,7 @@ static void draw_mycelium(uint32_t now, int grow_mode)
     cv_rect((int32_t)TR_X + 60, 0, 2, MY_SOIL, lite(drone_on ? 92 : 56));   /* the tree's foot, and its roots */
     cv_line((int32_t)TR_X + 60, MY_SOIL, (int32_t)TR_X + 54, MY_SOIL + 6, hair);
     cv_line((int32_t)TR_X + 61, MY_SOIL, (int32_t)TR_X + 67, MY_SOIL + 5, hair);
+    draw_wizard(now);
     if (my_g[0]) {                              /* the root's rootlets */
         my_node(0, now, &x, &y);
         for (j = 0; j < 3u; j++) {
@@ -1835,6 +1875,70 @@ static void arp_pt(uint32_t i, uint32_t n, int32_t r, int32_t *x, int32_t *y)
     uint32_t a = 0xFFFFFFFFu / n * i - 0x40000000u;   /* (no 64-bit division on the chip) */
     *x = 120 + sx(a, r); *y = ARP_H / 2 + sy(a, r);
 }
+/* ---- ENV: the envelope as a picture, in place of the sigil, scale and network. DRONE: it grows, breathes (the ripple
+ * is BREATH's depth) and withers. EVENTS and the TREE: attack, decay to the sustain level, a held stretch, release;
+ * each part as wide as its knob is far round. The TREE's is the keys' envelope; the two faint curves are what the
+ * weather makes of it: a raindrop (struck at once, falling over DECAY) and a breath of wind (a slower swell, held a
+ * step, RELEASE). */
+#define EV_B (ARP_H - 12)                       /* the floor, and the top */
+#define EV_T 12
+static void ev_fall(int32_t x0, int32_t y0, int32_t w, int32_t y1, uint16_t c, int32_t *xe)   /* a fall that slows as it lands */
+{
+    int32_t k, px = x0, py = y0;
+    for (k = 1; k <= 8; k++) {
+        int32_t u = 8 - k, x = x0 + w * k / 8, y = y1 + (y0 - y1) * u * u / 64;
+        cv_line(px, py, x, y, c);
+        px = x; py = y;
+    }
+    *xe = x0 + w;
+}
+static void draw_env(uint32_t e)
+{
+    uint32_t half;
+    int32_t x, x1, k;
+    uint16_t hi = lite(190), lo = lite(64), fl = lite(40);
+    for (half = 0; half < 2u; half++) {
+        cv_begin(240, ARP_H / 2, C_BLACK);
+        cv_oy = -(int32_t)half * (ARP_H / 2);
+        for (x = 16; x < 226; x += 3) cv_pset(x, EV_B + 1, fl);   /* the floor */
+        x = 18;
+        if (e == 0u) {                          /* DRONE */
+            int32_t wa = 10 + (int32_t)set.att[0] * 5, d = (int32_t)set.brt * (EV_B - EV_T) / 20, px, py;
+            for (k = 1, px = x, py = EV_B; k <= 8; k++) {   /* it grows: slowly at first */
+                int32_t xx = x + wa * k / 8, yy = EV_B - (EV_B - EV_T) * k * (16 - k) / 64;
+                cv_line(px, py, xx, yy, hi); px = xx; py = yy;
+            }
+            x += wa;
+            for (k = 1; k <= 60; k++) {         /* it breathes */
+                int32_t yy = EV_T + (d - ((sine((uint32_t)k * 0x0AAAAAAAu + 0x40000000u) * d) >> 15)) / 2;
+                cv_line(px, py, x + k, yy, hi); px = x + k; py = yy;
+            }
+            ev_fall(px, py, 10 + (int32_t)set.rel[0] * 5, EV_B, hi, &x1);   /* it withers */
+        } else {
+            uint32_t ai = set.att[e], di = set.dec[e - 1u], ri = set.rel[e];
+            int32_t sl = EV_B - (EV_B - EV_T) * (int32_t)set.sus[e - 1u] / 20;
+            if (e == 2u) {                      /* the TREE: what the rain and the wind make of it, faint */
+                uint32_t wi = ai + 4u < NATT ? ai + 4u : NATT - 1u;
+                int32_t wx = x + 8 + (int32_t)wi * 4, wy = EV_B - (EV_B - EV_T) * 5 / 8;
+                cv_line(x, EV_B, x + 2, EV_T + 8, lo);   /* a drop */
+                ev_fall(x + 2, EV_T + 8, 8 + (int32_t)di * 3, EV_B, lo, &x1);
+                cv_line(x, EV_B, wx, wy, lo);            /* the wind */
+                ev_fall(wx, wy, 8 + (int32_t)di * 3, EV_B - (EV_B - wy) * (int32_t)set.sus[1] / 20, lo, &x1);
+                cv_line(x1, EV_B - (EV_B - wy) * (int32_t)set.sus[1] / 20, x1 + 14, EV_B - (EV_B - wy) * (int32_t)set.sus[1] / 20, lo);
+                ev_fall(x1 + 14, EV_B - (EV_B - wy) * (int32_t)set.sus[1] / 20, 8 + (int32_t)ri * 4, EV_B, lo, &x1);
+            }
+            x1 = x + 8 + (int32_t)ai * 4;       /* attack */
+            cv_line(x, EV_B, x1, EV_T, hi);
+            ev_fall(x1, EV_T, 8 + (int32_t)di * 3, sl, hi, &x);   /* decay, to the sustain level */
+            cv_line(x, sl, x + 30, sl, hi);     /* held */
+            cv_rect(x + 29, sl - 1, 3, 3, hi);  /* (let go) */
+            ev_fall(x + 30, sl, 8 + (int32_t)ri * 4, EV_B, hi, &x1);   /* release */
+        }
+        cv_blit(0, ARP_Y + half * (uint32_t)(ARP_H / 2));
+    }
+    cv_oy = 0;
+}
+
 static void draw_arp(uint32_t now, uint32_t c)   /* c: 1 the tree's cycle, 0 ECO's */
 {
     uint32_t n = set.stp[c], h = set.hit[c], ro = set.rot[c], i, half, first = n, cs = c ? tr_step : cyc_step, ht = c ? tr_hit_ms : hit_ms;
@@ -2143,7 +2247,7 @@ static void app_main(void)
         if (b & (1u << BTN_ARP)) page = page == P_ARP1 ? P_ARP2 : P_ARP1; /* ARP: the tree's cycle; again: ECO's */
         if (b & (1u << BTN_EDIT)) page = page == P_EDIT ? P_HOME : P_EDIT;   /* EDIT: the bug's and the bird's voice (again: home) */
         if (b & (1u << BTN_FX)) page = page == P_FX1 ? P_FX2 : P_FX1;     /* FX: round the effect pages */
-        if (b & (1u << BTN_GLO)) page = page == P_BOOK ? P_HOME : P_BOOK; /* GLO: the BOOK of spells (again: home) */
+        if (b & (1u << BTN_GLO)) page = page == P_BOOK ? P_HOME : P_BOOK; /* GLO: the volumes (again: home) */
         if (b & (1u << BTN_REC)) { rec_t = fm1_ms; rec_done = 0; }        /* REC: a tap mutates a little; held, a lot */
         if (fm1_in.buttons >> BTN_REC & 1u && !rec_done && fm1_ms - rec_t > 600u) { rec_done = 1; roll(); say("BIG MUTATION"); dirty = 1; t_change = fm1_ms; }
         if (rel & (1u << BTN_REC) && !rec_done) { rec_done = 1; say_field(mutate(3u)); dirty = 1; t_change = fm1_ms; }
@@ -2299,6 +2403,11 @@ static void app_main(void)
             lv = 0; ls = "";
             if (say_v[1] && now - say_t[1] < 1800u) { ls = say_s[1]; lv = say_v[1]; }   /* right: what was just turned */
             if (lv != label2_drawn) { label2_drawn = lv; draw_text_box(120, 216, 114, &FONT_S, ls, lite(150), 2); }
+        } else if (page == P_ENV) {             /* ENV: the envelope's picture in place of the sigil, scale and network */
+            if (!arp_on) { lcd_fill(0, ARP_Y, 240, ARP_H + 4u, C_BLACK); arp_on = 1; arp_drawn = ~0u; }
+            st = 0x40000000u | env_ed;
+            for (k = 0; k < 4u; k++) st = st * 31u + CFG[page_field(P_ENV, k)];
+            if (st != arp_drawn) { arp_drawn = st; draw_env(env_ed); }
         } else if (page == P_ARP1 || page == P_ARP2) {   /* ARP: the ring in place of the sigil, scale and network */
             if (!arp_on) { lcd_fill(0, ARP_Y, 240, ARP_H + 4u, C_BLACK); arp_on = 1; arp_drawn = ~0u; }
             uint32_t c = page == P_ARP1, ht = c ? tr_hit_ms : hit_ms;   /* (ARP: the tree's; again: ECO's) */
@@ -2306,7 +2415,7 @@ static void app_main(void)
                  | (uint32_t)(ht && fm1_ms - ht < 240u) << 27 | (c ? (rain_now() + wind_now()) & 15u : 0u) << 28;
             if ((st != arp_drawn || (ht && fm1_ms - ht < 240u)) && fm1_ms - arp_t >= 40u) { arp_drawn = st; arp_t = fm1_ms; draw_arp(fm1_ms, c); }
         }
-        if (page != P_HOME && !(page == P_ARP1 || page == P_ARP2)) {
+        if (page != P_HOME && !(page == P_ARP1 || page == P_ARP2 || page == P_ENV)) {
             if (arp_on) { lcd_fill(0, ARP_Y, 240, ARP_H + 4u, C_BLACK); arp_on = 0; sigil_drawn = scale_drawn = note_drawn = net_drawn = ~0u; }
             if ((st = spell_now | scale_now << 4 | kl << 8) != sigil_drawn) { sigil_drawn = st; draw_sigil(spell_now, scale_now, (int)kl); }
             if ((st = spell_now | scale_now << 4 | tonic << 8 | kl << 12) != scale_drawn) { scale_drawn = st; draw_scale((int)kl); }
