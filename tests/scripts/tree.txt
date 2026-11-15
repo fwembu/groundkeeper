@@ -1,0 +1,35 @@
+# The tree and its weather: PLAY; F5 held (a DOWNPOUR), G5 held (a GUST); the second layer (F#5): RAIN and WIND to
+# nothing (the tree is still), then WIND full; EDIT; ARP (the tree's cycle), ARP again (ECO's); REC tapped (a small
+# mutation), held (a big one), SAVE (undo)
+100 btn 12
+4000 shot
+9000 keys 0x1000000
+10500 shot
+12000 keys 0
+15000 keys 0x4000000
+17500 shot
+18000 keys 0
+22000 keys 0x2000000
+22100 keys 0
+22200 enc 1 -10
+22300 enc 6 -10
+30000 shot
+30100 enc 6 10
+36000 shot
+36100 keys 0x2000000
+36200 keys 0
+37000 btn 6
+37500 shot
+38000 btn 10
+39000 shot
+39500 btn 10
+40000 shot
+40500 btn 8
+41000 btn 13
+41300 shot
+42000 btndown 13
+43000 btnup 13
+43300 shot
+46000 btn 9
+46300 shot
+50000 end
